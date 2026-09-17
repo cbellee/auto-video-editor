@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"github.com/cbellee/auto-video-editor/internal/edit"
 )
 
 const (
 	exitSuccess = 0
 	exitFailure = 1
 	exitUsage   = 2
+	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force]\n"
 )
 
 type outputMode int
@@ -37,7 +40,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	case "-h", "--help", "help":
 		return helpExitCode(stdout)
 	case "edit":
-		return runPlaceholder(ctx, "edit", "<folder>", args[1:], stdout, stderr)
+		return runEdit(ctx, args[1:], mode, stdout, stderr)
 	case "render":
 		return runPlaceholder(ctx, "render", "<plan.json>", args[1:], stdout, stderr)
 	case "doctor":
@@ -57,6 +60,66 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 		return exitUsage
 	}
+}
+
+func runEdit(ctx context.Context, args []string, mode outputMode, stdout, stderr io.Writer) int {
+	if hasHelp(args) {
+		return writeExitCode(stdout, exitSuccess, editUsage)
+	}
+	options, err := parseEditOptions(args)
+	if err != nil {
+		return writeExitCode(
+			stderr,
+			exitUsage,
+			"%v\n%s",
+			err,
+			editUsage,
+		)
+	}
+
+	result, err := edit.Run(ctx, options)
+	if err != nil {
+		return writeExitCode(stderr, exitFailure, "edit failed: %v\n", err)
+	}
+	if mode != outputQuiet {
+		if code := writeExitCode(stdout, exitSuccess, "Edit Plan: %s\n", result.PlanPath); code != exitSuccess {
+			return code
+		}
+		if result.VideoPath != "" {
+			return writeExitCode(stdout, exitSuccess, "Finished Video: %s\n", result.VideoPath)
+		}
+	}
+	return exitSuccess
+}
+
+func parseEditOptions(args []string) (edit.Options, error) {
+	var options edit.Options
+	for index := 0; index < len(args); index++ {
+		switch args[index] {
+		case "--plan-only":
+			options.PlanOnly = true
+		case "--force":
+			options.Force = true
+		case "--output":
+			index++
+			if index >= len(args) || strings.HasPrefix(args[index], "-") {
+				return edit.Options{}, fmt.Errorf("--output requires a file path")
+			}
+			options.Output = args[index]
+		default:
+			if strings.HasPrefix(args[index], "-") {
+				return edit.Options{}, fmt.Errorf("unknown edit option %q", args[index])
+			}
+			if options.SourceDir != "" {
+				return edit.Options{}, fmt.Errorf("edit accepts one source folder")
+			}
+			options.SourceDir = args[index]
+		}
+	}
+	if options.SourceDir == "" {
+		return edit.Options{}, fmt.Errorf("source folder is required")
+	}
+	return options, nil
 }
 
 func helpExitCode(writer io.Writer) int {
