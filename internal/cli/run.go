@@ -15,6 +15,7 @@ const (
 	exitFailure = 1
 	exitUsage   = 2
 	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force]\n"
+	renderUsage = "usage: ave render <plan.json> [--media-root <dir>] [--force]\n"
 )
 
 type outputMode int
@@ -42,7 +43,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	case "edit":
 		return runEdit(ctx, args[1:], mode, stdout, stderr)
 	case "render":
-		return runPlaceholder(ctx, "render", "<plan.json>", args[1:], stdout, stderr)
+		return runRender(ctx, args[1:], mode, stdout, stderr)
 	case "doctor":
 		if hasHelp(args[1:]) {
 			return writeExitCode(stdout, exitSuccess, "usage: ave doctor [--verbose | --quiet]\n")
@@ -136,24 +137,51 @@ func writeExitCode(writer io.Writer, successCode int, format string, args ...any
 	return successCode
 }
 
-func runPlaceholder(
-	ctx context.Context,
-	command string,
-	argument string,
-	args []string,
-	stdout io.Writer,
-	stderr io.Writer,
-) int {
+func runRender(ctx context.Context, args []string, mode outputMode, stdout, stderr io.Writer) int {
 	if hasHelp(args) {
-		return writeExitCode(stdout, exitSuccess, "usage: ave %s %s [options]\n", command, argument)
+		return writeExitCode(stdout, exitSuccess, renderUsage)
 	}
-	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
-		return writeExitCode(stderr, exitUsage, "usage: ave %s %s [options]\n", command, argument)
+	options, err := parseRenderOptions(args)
+	if err != nil {
+		return writeExitCode(stderr, exitUsage, "%v\n%s", err, renderUsage)
 	}
-	if err := ctx.Err(); err != nil {
-		return writeExitCode(stderr, exitFailure, "%s cancelled: %v\n", command, err)
+
+	result, err := edit.RenderPlan(ctx, options)
+	if err != nil {
+		return writeExitCode(stderr, exitFailure, "render failed: %v\n", err)
 	}
-	return writeExitCode(stderr, exitFailure, "%s is not implemented yet\n", command)
+	if mode != outputQuiet {
+		return writeExitCode(stdout, exitSuccess, "Finished Video: %s\n", result.VideoPath)
+	}
+	return exitSuccess
+}
+
+func parseRenderOptions(args []string) (edit.RenderOptions, error) {
+	var options edit.RenderOptions
+	for index := 0; index < len(args); index++ {
+		switch args[index] {
+		case "--force":
+			options.Force = true
+		case "--media-root":
+			index++
+			if index >= len(args) || strings.HasPrefix(args[index], "-") {
+				return edit.RenderOptions{}, fmt.Errorf("--media-root requires a folder path")
+			}
+			options.MediaRoot = args[index]
+		default:
+			if strings.HasPrefix(args[index], "-") {
+				return edit.RenderOptions{}, fmt.Errorf("unknown render option %q", args[index])
+			}
+			if options.PlanPath != "" {
+				return edit.RenderOptions{}, fmt.Errorf("render accepts one Edit Plan")
+			}
+			options.PlanPath = args[index]
+		}
+	}
+	if options.PlanPath == "" {
+		return edit.RenderOptions{}, fmt.Errorf("missing Edit Plan path")
+	}
+	return options, nil
 }
 
 func parseOutputMode(args []string) ([]string, outputMode, error) {
