@@ -1,2 +1,28 @@
+# macOS
 .DS_Store
+
+# Local application binary
 /ave
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Coverage profiles and test artifacts
+*.out
+*.coverprofile
+profile.cov
+/coverage-data/
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Local environment
+.env

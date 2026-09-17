@@ -29,6 +29,29 @@ func TestCLICommandContracts(t *testing.T) {
 			wantOutput: []string{"Usage: ave", "edit", "render", "doctor"},
 		},
 		{
+			name:       "no arguments shows root help",
+			wantStatus: 0,
+			wantOutput: []string{"Usage: ave", "doctor"},
+		},
+		{
+			name:       "edit help shows source argument",
+			args:       []string{"edit", "--help"},
+			wantStatus: 0,
+			wantOutput: []string{"usage: ave edit <folder>"},
+		},
+		{
+			name:       "render help shows plan argument",
+			args:       []string{"render", "--help"},
+			wantStatus: 0,
+			wantOutput: []string{"usage: ave render <plan.json>"},
+		},
+		{
+			name:       "doctor help shows output modes",
+			args:       []string{"doctor", "--help"},
+			wantStatus: 0,
+			wantOutput: []string{"usage: ave doctor", "--verbose", "--quiet"},
+		},
+		{
 			name:       "edit requires source folder",
 			args:       []string{"edit"},
 			wantStatus: 2,
@@ -242,13 +265,52 @@ func TestDoctorReportsActionableFailures(t *testing.T) {
 			t.Errorf("output does not reject remote endpoint:\n%s", output)
 		}
 	})
+
+	t.Run("LM Studio returns invalid JSON", func(t *testing.T) {
+		toolDir := createFakeTools(t, true)
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			if _, err := writer.Write([]byte("not-json")); err != nil {
+				t.Errorf("write invalid response: %v", err)
+			}
+		}))
+		t.Cleanup(server.Close)
+
+		status, output := runCLIWithEnv(t, binary, doctorEnv(t, toolDir, server.URL), "doctor")
+		if status != 1 {
+			t.Fatalf("status = %d, want 1\noutput:\n%s", status, output)
+		}
+		if !strings.Contains(output, "[missing] LM Studio: model API returned invalid JSON") {
+			t.Errorf("output does not identify invalid model response:\n%s", output)
+		}
+	})
+
+	t.Run("LM Studio returns HTTP error", func(t *testing.T) {
+		toolDir := createFakeTools(t, true)
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			http.Error(writer, "unavailable", http.StatusServiceUnavailable)
+		}))
+		t.Cleanup(server.Close)
+
+		status, output := runCLIWithEnv(t, binary, doctorEnv(t, toolDir, server.URL), "doctor")
+		if status != 1 {
+			t.Fatalf("status = %d, want 1\noutput:\n%s", status, output)
+		}
+		if !strings.Contains(output, "[missing] LM Studio: model API returned HTTP 503") {
+			t.Errorf("output does not identify model server error:\n%s", output)
+		}
+	})
 }
 
 func buildCLI(t *testing.T) string {
 	t.Helper()
 
 	binary := filepath.Join(t.TempDir(), "ave")
-	command := exec.Command("go", "build", "-o", binary, "./cmd/ave")
+	args := []string{"build"}
+	if os.Getenv("AVE_COVER_DIR") != "" {
+		args = append(args, "-race", "-cover")
+	}
+	args = append(args, "-o", binary, "./cmd/ave")
+	command := exec.Command("go", args...)
 	var output bytes.Buffer
 	command.Stdout = &output
 	command.Stderr = &output
@@ -267,6 +329,9 @@ func runCLIWithEnv(t *testing.T, binary string, env []string, args ...string) (i
 	t.Helper()
 
 	command := exec.Command(binary, args...)
+	if coverageDir := os.Getenv("AVE_COVER_DIR"); coverageDir != "" {
+		env = append(env, "GOCOVERDIR="+coverageDir)
+	}
 	command.Env = env
 	var output bytes.Buffer
 	command.Stdout = &output

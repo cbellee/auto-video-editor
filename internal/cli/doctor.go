@@ -12,8 +12,12 @@ func runDoctor(ctx context.Context, mode outputMode, stdout, stderr io.Writer) i
 	report := doctor.Check(ctx)
 
 	if mode == outputVerbose {
-		fmt.Fprintf(stdout, "config directory: %s\n", report.ConfigDir)
-		fmt.Fprintf(stdout, "cache directory: %s\n", report.CacheDir)
+		if _, err := fmt.Fprintf(stdout, "config directory: %s\n", report.ConfigDir); err != nil {
+			return exitFailure
+		}
+		if _, err := fmt.Fprintf(stdout, "cache directory: %s\n", report.CacheDir); err != nil {
+			return exitFailure
+		}
 	}
 
 	for _, result := range report.Results {
@@ -29,24 +33,34 @@ func runDoctor(ctx context.Context, mode outputMode, stdout, stderr io.Writer) i
 		if !result.Ready {
 			state = "missing"
 		}
-		fmt.Fprintf(writer, "[%s] %s: %s\n", state, result.Name, result.Summary)
+		if _, err := fmt.Fprintf(writer, "[%s] %s: %s\n", state, result.Name, result.Summary); err != nil {
+			return exitFailure
+		}
 		if mode == outputVerbose && result.Detail != "" {
-			fmt.Fprintf(writer, "  %s\n", result.Detail)
+			if _, err := fmt.Fprintf(writer, "  %s\n", result.Detail); err != nil {
+				return exitFailure
+			}
 		}
 		if !result.Ready && result.Remedy != "" {
-			fmt.Fprintf(writer, "  Fix: %s\n", result.Remedy)
+			if _, err := fmt.Fprintf(writer, "  Fix: %s\n", result.Remedy); err != nil {
+				return exitFailure
+			}
 		}
 	}
 
 	if !report.Ready() {
 		if mode != outputQuiet {
-			fmt.Fprintln(stderr, "Doctor found missing or incompatible dependencies.")
+			if _, err := fmt.Fprintln(stderr, "Doctor found missing or incompatible dependencies."); err != nil {
+				return exitFailure
+			}
 		}
 		return exitFailure
 	}
 
 	if mode != outputQuiet {
-		fmt.Fprintln(stdout, "All required dependencies are ready.")
+		if _, err := fmt.Fprintln(stdout, "All required dependencies are ready."); err != nil {
+			return exitFailure
+		}
 	}
 	return exitSuccess
 }

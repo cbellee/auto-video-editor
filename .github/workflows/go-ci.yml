@@ -1,0 +1,91 @@
+name: Go CI
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Format, vet, test, and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l $(git ls-files '*.go'))"
+          if [[ -n "$unformatted" ]]; then
+            echo "The following files require gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Check module files
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        env:
+          AVE_COVER_DIR: ${{ github.workspace }}/coverage-data
+        run: |
+          mkdir -p "$AVE_COVER_DIR"
+          go test -race -shuffle=on ./...
+          go tool covdata textfmt -i="$AVE_COVER_DIR" -o=coverage.out
+
+      - name: Report coverage
+        shell: bash
+        run: |
+          go tool cover -func=coverage.out
+          coverage="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')"
+          awk -v coverage="$coverage" 'BEGIN {
+            if (coverage + 0 < 80) {
+              printf "coverage %.1f%% is below the required 80%%\n", coverage
+              exit 1
+            }
+          }'
+
+      - name: Build
+        run: go build ./...
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13
+          args: --timeout=5m
