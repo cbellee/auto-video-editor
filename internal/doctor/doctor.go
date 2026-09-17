@@ -213,10 +213,16 @@ func checkLMStudio(ctx context.Context) Result {
 	if err != nil {
 		return missingResult(name, "server unavailable", "start the LM Studio local server and retry")
 	}
-	defer response.Body.Close()
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, 4<<20))
+	closeErr := response.Body.Close()
+	if readErr != nil {
+		return missingResult(name, "cannot read model API response", "update or restart LM Studio")
+	}
+	if closeErr != nil {
+		return missingResult(name, "cannot close model API response", "update or restart LM Studio")
+	}
 
 	if response.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, response.Body)
 		return missingResult(
 			name,
 			fmt.Sprintf("model API returned HTTP %d", response.StatusCode),
@@ -233,7 +239,7 @@ func checkLMStudio(ctx context.Context) Result {
 			} `json:"capabilities"`
 		} `json:"models"`
 	}
-	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+	if err := json.Unmarshal(body, &payload); err != nil {
 		return missingResult(name, "model API returned invalid JSON", "update or restart LM Studio")
 	}
 
