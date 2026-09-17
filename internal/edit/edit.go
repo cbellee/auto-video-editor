@@ -22,6 +22,7 @@ import (
 const planVersion = "1"
 
 var supportedExtensions = map[string]bool{
+	".avi": true,
 	".mkv": true,
 	".mov": true,
 	".mp4": true,
