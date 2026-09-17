@@ -520,6 +520,294 @@ func TestEditReportsProbeFailures(t *testing.T) {
 	}
 }
 
+func TestRenderRebuildsFinishedVideoOffline(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir := t.TempDir()
+	sourceDir := filepath.Join(workingDir, "clips")
+	if err := os.Mkdir(sourceDir, 0o755); err != nil {
+		t.Fatalf("create source folder: %v", err)
+	}
+	writeTestFile(t, filepath.Join(sourceDir, "a-earlier.mov"), "alpha-source-bytes")
+	writeTestFile(t, filepath.Join(sourceDir, "b-later.mp4"), "bravo-source-bytes")
+
+	tools := createEditTools(t)
+	ffmpegLog := filepath.Join(workingDir, "ffmpeg.log")
+	outputPath := filepath.Join(workingDir, "story.mp4")
+	planPath := filepath.Join(workingDir, "story.plan.json")
+	env := append(os.Environ(), "PATH="+tools+string(os.PathListSeparator)+os.Getenv("PATH"), "AVE_TEST_FFMPEG_LOG="+ffmpegLog)
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--output", outputPath)
+	if status != 0 {
+		t.Fatalf("edit failed: %d\n%s", status, output)
+	}
+
+	// Prove render is offline: delete the Finished Video and the ffmpeg log,
+	// then rerender purely from the saved Edit Plan.
+	if err := os.Remove(outputPath); err != nil {
+		t.Fatalf("remove Finished Video: %v", err)
+	}
+	if err := os.Remove(ffmpegLog); err != nil {
+		t.Fatalf("remove ffmpeg log: %v", err)
+	}
+	probeCalls := filepath.Join(workingDir, "render-ffprobe.calls")
+	renderEnv := append(env, "AVE_TEST_FFPROBE_CALLS="+probeCalls)
+
+	status, output = runCLIInDir(t, binary, workingDir, renderEnv, "render", planPath)
+	if status != 0 {
+		t.Fatalf("render failed: %d\n%s", status, output)
+	}
+	if !strings.Contains(output, "Finished Video: "+outputPath) {
+		t.Errorf("render did not report the Finished Video path:\n%s", output)
+	}
+	if _, err := os.Stat(outputPath); err != nil {
+		t.Errorf("render did not recreate the Finished Video: %v", err)
+	}
+	if info, err := os.Stat(outputPath); err == nil && info.Mode().Perm() != 0o644 {
+		t.Errorf("Finished Video mode = %v, want 0644", info.Mode().Perm())
+	}
+	if _, err := os.Stat(probeCalls); !errors.Is(err, os.ErrNotExist) {
+		data, _ := os.ReadFile(probeCalls)
+		t.Errorf("render performed analysis (invoked ffprobe):\n%s", data)
+	}
+	ffmpegArgs, err := os.ReadFile(ffmpegLog)
+	if err != nil {
+		t.Fatalf("read ffmpeg log: %v", err)
+	}
+	for _, want := range []string{"-map_metadata -1", "-c:v libx264", "-f mp4"} {
+		if !strings.Contains(string(ffmpegArgs), want) {
+			t.Errorf("render ffmpeg invocation missing %q:\n%s", want, ffmpegArgs)
+		}
+	}
+	if !strings.Contains(string(ffmpegArgs), ".ave-render-") {
+		t.Errorf("render did not encode into a temporary file:\n%s", ffmpegArgs)
+	}
+}
+
+func TestRenderDetectsMissingAndChangedSources(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir := t.TempDir()
+	sourceDir := filepath.Join(workingDir, "clips")
+	if err := os.Mkdir(sourceDir, 0o755); err != nil {
+		t.Fatalf("create source folder: %v", err)
+	}
+	missingSource := filepath.Join(sourceDir, "a-earlier.mov")
+	changedSource := filepath.Join(sourceDir, "b-later.mp4")
+	writeTestFile(t, missingSource, "alpha-source-bytes")
+	writeTestFile(t, changedSource, "bravo-source-bytes")
+
+	tools := createEditTools(t)
+	ffmpegLog := filepath.Join(workingDir, "ffmpeg.log")
+	outputPath := filepath.Join(workingDir, "story.mp4")
+	planPath := filepath.Join(workingDir, "story.plan.json")
+	env := append(os.Environ(), "PATH="+tools+string(os.PathListSeparator)+os.Getenv("PATH"), "AVE_TEST_FFMPEG_LOG="+ffmpegLog)
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--output", outputPath, "--plan-only")
+	if status != 0 {
+		t.Fatalf("edit failed: %d\n%s", status, output)
+	}
+
+	if err := os.Remove(missingSource); err != nil {
+		t.Fatalf("remove Source Clip: %v", err)
+	}
+	writeTestFile(t, changedSource, "bravo-source-bytes-CHANGED")
+
+	status, output = runCLIInDir(t, binary, workingDir, env, "render", planPath)
+	if status != 1 {
+		t.Fatalf("expected render failure, got %d\n%s", status, output)
+	}
+	if !strings.Contains(output, "a-earlier.mov") || !strings.Contains(output, "missing") {
+		t.Errorf("render did not report the missing Source Clip:\n%s", output)
+	}
+	if !strings.Contains(output, "b-later.mp4") || !strings.Contains(output, "changed") {
+		t.Errorf("render did not report the changed Source Clip:\n%s", output)
+	}
+	if _, err := os.Stat(outputPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("render produced a Finished Video despite source problems")
+	}
+}
+
+func TestRenderRelocatesSourcesWithMediaRoot(t *testing.T) {
+	binary := buildCLI(t)
+	projectDir := t.TempDir()
+	sourceA := filepath.Join(projectDir, "a-earlier.mov")
+	sourceB := filepath.Join(projectDir, "b-later.mp4")
+	writeTestFile(t, sourceA, "alpha-source-bytes")
+	writeTestFile(t, sourceB, "bravo-source-bytes")
+
+	tools := createEditTools(t)
+	ffmpegLog := filepath.Join(t.TempDir(), "ffmpeg.log")
+	outputPath := filepath.Join(projectDir, "story.mp4")
+	planPath := filepath.Join(projectDir, "story.plan.json")
+	env := append(os.Environ(), "PATH="+tools+string(os.PathListSeparator)+os.Getenv("PATH"), "AVE_TEST_FFMPEG_LOG="+ffmpegLog)
+
+	status, output := runCLIInDir(t, binary, projectDir, env, "edit", projectDir, "--output", outputPath, "--plan-only")
+	if status != 0 {
+		t.Fatalf("edit failed: %d\n%s", status, output)
+	}
+
+	newRoot := t.TempDir()
+	copyTestFile(t, filepath.Join(newRoot, "a-earlier.mov"), sourceA)
+	copyTestFile(t, filepath.Join(newRoot, "b-later.mp4"), sourceB)
+	if err := os.Remove(sourceA); err != nil {
+		t.Fatalf("remove Source Clip: %v", err)
+	}
+	if err := os.Remove(sourceB); err != nil {
+		t.Fatalf("remove Source Clip: %v", err)
+	}
+
+	status, output = runCLIInDir(t, binary, projectDir, env, "render", planPath)
+	if status != 1 {
+		t.Fatalf("expected failure without media root, got %d\n%s", status, output)
+	}
+
+	status, output = runCLIInDir(t, binary, projectDir, env, "render", planPath, "--media-root", newRoot)
+	if status != 0 {
+		t.Fatalf("relocation render failed: %d\n%s", status, output)
+	}
+	if _, err := os.Stat(outputPath); err != nil {
+		t.Errorf("relocated render did not create the Finished Video: %v", err)
+	}
+
+	if err := os.Remove(outputPath); err != nil {
+		t.Fatalf("remove Finished Video: %v", err)
+	}
+	writeTestFile(t, filepath.Join(newRoot, "b-later.mp4"), "bravo-source-bytes-TAMPERED")
+	status, output = runCLIInDir(t, binary, projectDir, env, "render", planPath, "--media-root", newRoot)
+	if status != 1 {
+		t.Fatalf("expected failure for tampered relocated source, got %d\n%s", status, output)
+	}
+	if !strings.Contains(output, "b-later.mp4") || !strings.Contains(output, "changed") {
+		t.Errorf("render did not report the tampered relocated Source Clip:\n%s", output)
+	}
+}
+
+func TestRenderRequiresForceToReplaceFinishedVideo(t *testing.T) {
+	binary := buildCLI(t)
+	projectDir := t.TempDir()
+	writeTestFile(t, filepath.Join(projectDir, "clip.mov"), "only-source-bytes")
+
+	tools := createEditTools(t)
+	ffmpegLog := filepath.Join(t.TempDir(), "ffmpeg.log")
+	outputPath := filepath.Join(projectDir, "story.mp4")
+	planPath := filepath.Join(projectDir, "story.plan.json")
+	env := append(os.Environ(), "PATH="+tools+string(os.PathListSeparator)+os.Getenv("PATH"), "AVE_TEST_FFMPEG_LOG="+ffmpegLog)
+
+	status, output := runCLIInDir(t, binary, projectDir, env, "edit", projectDir, "--output", outputPath)
+	if status != 0 {
+		t.Fatalf("edit failed: %d\n%s", status, output)
+	}
+	if _, err := os.Stat(outputPath); err != nil {
+		t.Fatalf("edit did not create the Finished Video: %v", err)
+	}
+
+	status, output = runCLIInDir(t, binary, projectDir, env, "render", planPath)
+	if status != 1 {
+		t.Fatalf("expected overwrite refusal, got %d\n%s", status, output)
+	}
+	if !strings.Contains(output, "refusing to overwrite existing artifact") || !strings.Contains(output, "--force") {
+		t.Errorf("overwrite refusal was not actionable:\n%s", output)
+	}
+
+	if err := os.WriteFile(outputPath, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("stage stale Finished Video: %v", err)
+	}
+	status, output = runCLIInDir(t, binary, projectDir, env, "render", planPath, "--force")
+	if status != 0 {
+		t.Fatalf("forced render failed: %d\n%s", status, output)
+	}
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("read Finished Video: %v", err)
+	}
+	if string(data) != "finished video" {
+		t.Errorf("forced render did not replace the Finished Video: %q", data)
+	}
+}
+
+func TestRenderRemovesIncompleteOutputOnFailure(t *testing.T) {
+	binary := buildCLI(t)
+	projectDir := t.TempDir()
+	writeTestFile(t, filepath.Join(projectDir, "clip.mov"), "only-source-bytes")
+
+	tools := createEditTools(t)
+	ffmpegLog := filepath.Join(t.TempDir(), "ffmpeg.log")
+	outputPath := filepath.Join(projectDir, "story.mp4")
+	planPath := filepath.Join(projectDir, "story.plan.json")
+	env := append(os.Environ(), "PATH="+tools+string(os.PathListSeparator)+os.Getenv("PATH"), "AVE_TEST_FFMPEG_LOG="+ffmpegLog)
+
+	status, output := runCLIInDir(t, binary, projectDir, env, "edit", projectDir, "--output", outputPath, "--plan-only")
+	if status != 0 {
+		t.Fatalf("edit failed: %d\n%s", status, output)
+	}
+
+	failEnv := append(env, "AVE_TEST_FFMPEG_FAIL=1")
+	status, output = runCLIInDir(t, binary, projectDir, failEnv, "render", planPath)
+	if status != 1 {
+		t.Fatalf("expected render failure, got %d\n%s", status, output)
+	}
+	if !strings.Contains(output, "render failed") {
+		t.Errorf("render failure was not reported:\n%s", output)
+	}
+	if _, err := os.Stat(outputPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("incomplete Finished Video was left behind")
+	}
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		t.Fatalf("read project folder: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".ave-render-") {
+			t.Errorf("temporary render artifact left behind: %s", entry.Name())
+		}
+	}
+}
+
+func TestRenderRejectsInvalidInputs(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir := t.TempDir()
+	badVersion := filepath.Join(workingDir, "bad.plan.json")
+	writeTestFile(t, badVersion, `{"version":"999","finished_video":"out.mp4","selected_segments":[{"source_path":"x.mov","start_seconds":0,"end_seconds":1}]}`)
+	malformed := filepath.Join(workingDir, "malformed.plan.json")
+	writeTestFile(t, malformed, "not json")
+
+	validRender := `"render":{"container":"mp4","video_codec":"libx264","audio_codec":"aac","video_width":1280,"video_height":720,"video_frame_rate":30,"pixel_format":"yuv420p","audio_sample_rate":48000,"audio_channels":2,"audio_channel_layout":"stereo","fast_start":true}`
+	incompleteRender := filepath.Join(workingDir, "incomplete-render.plan.json")
+	writeTestFile(t, incompleteRender, `{"version":"1","finished_video":"out.mp4","selected_segments":[{"source_path":"x.mov","source_fingerprint":"v1:1:aa","start_seconds":0,"end_seconds":1}],"render":{}}`)
+	emptyRange := filepath.Join(workingDir, "empty-range.plan.json")
+	writeTestFile(t, emptyRange, `{"version":"1","finished_video":"out.mp4","selected_segments":[{"source_path":"x.mov","source_fingerprint":"v1:1:aa","start_seconds":2,"end_seconds":2}],`+validRender+`}`)
+	missingFingerprint := filepath.Join(workingDir, "missing-fingerprint.plan.json")
+	writeTestFile(t, missingFingerprint, `{"version":"1","finished_video":"out.mp4","selected_segments":[{"source_path":"x.mov","start_seconds":0,"end_seconds":1}],`+validRender+`}`)
+
+	tests := []struct {
+		name       string
+		args       []string
+		wantStatus int
+		wantOutput string
+	}{
+		{"unknown option", []string{"render", "plan.json", "--unknown"}, 2, `unknown render option "--unknown"`},
+		{"media-root requires value", []string{"render", "plan.json", "--media-root"}, 2, "--media-root requires a folder path"},
+		{"single plan only", []string{"render", "a.json", "b.json"}, 2, "render accepts one Edit Plan"},
+		{"missing plan path", []string{"render"}, 2, "missing Edit Plan path"},
+		{"missing plan file", []string{"render", filepath.Join(workingDir, "nope.plan.json")}, 1, "open Edit Plan"},
+		{"malformed plan", []string{"render", malformed}, 1, "decode Edit Plan"},
+		{"unsupported version", []string{"render", badVersion}, 1, "unsupported Edit Plan version"},
+		{"incomplete render settings", []string{"render", incompleteRender}, 1, "incomplete Edit Plan render settings"},
+		{"empty segment range", []string{"render", emptyRange}, 1, "empty range"},
+		{"missing source fingerprint", []string{"render", missingFingerprint}, 1, "missing a source fingerprint"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			status, output := runCLIInDir(t, binary, workingDir, os.Environ(), test.args...)
+			if status != test.wantStatus {
+				t.Fatalf("status = %d, want %d\n%s", status, test.wantStatus, output)
+			}
+			if !strings.Contains(output, test.wantOutput) {
+				t.Errorf("output does not contain %q:\n%s", test.wantOutput, output)
+			}
+		})
+	}
+}
+
 func TestCLICommandContracts(t *testing.T) {
 	binary := buildCLI(t)
 
@@ -865,6 +1153,7 @@ func createEditTools(t *testing.T) string {
 
 	dir := t.TempDir()
 	writeExecutable(t, dir, "ffprobe", `#!/bin/sh
+if [ -n "$AVE_TEST_FFPROBE_CALLS" ]; then echo call >> "$AVE_TEST_FFPROBE_CALLS"; fi
 case "$AVE_TEST_FFPROBE_MODE" in
   fail) exit 1 ;;
   malformed) printf 'not-json\n'; exit ;;
@@ -894,6 +1183,11 @@ case "$*" in
 esac
 printf '%s\n' "$*" > "$AVE_TEST_FFMPEG_LOG"
 for output do :; done
+if [ -n "$AVE_TEST_FFMPEG_FAIL" ]; then
+  printf 'partial' > "$output"
+  echo "ffmpeg: induced failure" >&2
+  exit 1
+fi
 printf 'finished video' > "$output"
 `)
 	return dir
@@ -961,6 +1255,26 @@ func writeExecutable(t *testing.T, dir, name, content string) {
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
 		t.Fatalf("write fake %s: %v", name, err)
+	}
+}
+
+func writeTestFile(t *testing.T, path, content string) {
+	t.Helper()
+
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func copyTestFile(t *testing.T, dst, src string) {
+	t.Helper()
+
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("read %s: %v", src, err)
+	}
+	if err := os.WriteFile(dst, data, 0o644); err != nil {
+		t.Fatalf("write %s: %v", dst, err)
 	}
 }
 
