@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/cbellee/auto-video-editor/internal/ffmpeg"
 )
 
 const defaultLMStudioURL = "http://127.0.0.1:1234"
@@ -108,8 +110,8 @@ func checkFFmpeg(ctx context.Context) Result {
 		"xfade",
 		"acrossfade",
 	}
-	availableFilters := capabilityNames(filters)
-	availableEncoders := capabilityNames(encoders)
+	availableFilters := ffmpeg.CapabilityNames(filters)
+	availableEncoders := ffmpeg.CapabilityNames(encoders)
 	var missing []string
 	for _, filter := range requiredFilters {
 		if !availableFilters[filter] {
@@ -137,18 +139,6 @@ func checkFFmpeg(ctx context.Context) Result {
 		Summary: firstLine(version),
 		Detail:  path,
 	}
-}
-
-func capabilityNames(output string) map[string]bool {
-	names := make(map[string]bool)
-	for line := range strings.Lines(output) {
-		fields := strings.Fields(line)
-		if len(fields) < 2 || fields[1] == "=" {
-			continue
-		}
-		names[fields[1]] = true
-	}
-	return names
 }
 
 func checkCommand(

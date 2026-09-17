@@ -2,6 +2,7 @@ package ave_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -12,6 +13,512 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestEditCreatesChronologicalPlanAndFinishedVideo(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir := t.TempDir()
+	sourceDir := filepath.Join(workingDir, "holiday")
+	if err := os.Mkdir(sourceDir, 0o755); err != nil {
+		t.Fatalf("create source directory: %v", err)
+	}
+	for _, name := range []string{"01-later.mp4", "02-earlier.mov", "notes.txt"} {
+		if err := os.WriteFile(filepath.Join(sourceDir, name), []byte("fixture"), 0o644); err != nil {
+			t.Fatalf("write source fixture: %v", err)
+		}
+	}
+
+	toolDir := createEditTools(t)
+	logPath := filepath.Join(workingDir, "ffmpeg.log")
+	env := append(os.Environ(), "PATH="+toolDir, "AVE_TEST_FFMPEG_LOG="+logPath)
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir)
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+
+	planPath := filepath.Join(workingDir, "holiday-edit.plan.json")
+	videoPath := filepath.Join(workingDir, "holiday-edit.mp4")
+	for _, path := range []string{planPath, videoPath} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("expected artifact %s: %v", path, err)
+		}
+	}
+
+	var plan struct {
+		Version          string `json:"version"`
+		EditIntent       string `json:"edit_intent"`
+		FinishedVideoSHA string `json:"finished_video_sha256"`
+		Segments         []struct {
+			SourcePath string  `json:"source_path"`
+			Start      float64 `json:"start_seconds"`
+			End        float64 `json:"end_seconds"`
+		} `json:"selected_segments"`
+		Render struct {
+			Container          string `json:"container"`
+			VideoCodec         string `json:"video_codec"`
+			AudioCodec         string `json:"audio_codec"`
+			VideoWidth         int    `json:"video_width"`
+			VideoHeight        int    `json:"video_height"`
+			VideoFrameRate     int    `json:"video_frame_rate"`
+			PixelFormat        string `json:"pixel_format"`
+			AudioSampleRate    int    `json:"audio_sample_rate"`
+			AudioChannels      int    `json:"audio_channels"`
+			AudioChannelLayout string `json:"audio_channel_layout"`
+			FastStart          bool   `json:"fast_start"`
+		} `json:"render"`
+	}
+	planData, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read Edit Plan: %v", err)
+	}
+	if err := json.Unmarshal(planData, &plan); err != nil {
+		t.Fatalf("decode Edit Plan: %v\n%s", err, planData)
+	}
+	if plan.Version != "1" {
+		t.Errorf("plan version = %q, want 1", plan.Version)
+	}
+	if plan.EditIntent != "chronological" {
+		t.Errorf("Edit Intent = %q, want chronological", plan.EditIntent)
+	}
+	if len(plan.FinishedVideoSHA) != 64 {
+		t.Errorf("Finished Video fingerprint length = %d, want 64", len(plan.FinishedVideoSHA))
+	}
+	if len(plan.Segments) != 2 {
+		t.Fatalf("selected segments = %d, want 2", len(plan.Segments))
+	}
+	if got := filepath.Base(plan.Segments[0].SourcePath); got != "02-earlier.mov" {
+		t.Errorf("first Source Clip = %q, want 02-earlier.mov", got)
+	}
+	if got := filepath.Base(plan.Segments[1].SourcePath); got != "01-later.mp4" {
+		t.Errorf("second Source Clip = %q, want 01-later.mp4", got)
+	}
+	for index, segment := range plan.Segments {
+		if segment.Start != 0 || segment.End != 4.5 {
+			t.Errorf("segment %d range = %.1f-%.1f, want 0.0-4.5", index, segment.Start, segment.End)
+		}
+	}
+	if plan.Render.Container != "mp4" ||
+		plan.Render.VideoCodec != "libx264" ||
+		plan.Render.AudioCodec != "aac" ||
+		plan.Render.VideoWidth != 1280 ||
+		plan.Render.VideoHeight != 720 ||
+		plan.Render.VideoFrameRate != 30 ||
+		plan.Render.PixelFormat != "yuv420p" ||
+		plan.Render.AudioSampleRate != 48000 ||
+		plan.Render.AudioChannels != 2 ||
+		plan.Render.AudioChannelLayout != "stereo" ||
+		!plan.Render.FastStart {
+		t.Errorf("unexpected render settings: %+v", plan.Render)
+	}
+
+	ffmpegLog, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read FFmpeg log: %v", err)
+	}
+	for _, want := range []string{
+		"-filter_complex",
+		"concat=n=2:v=1:a=0[video]",
+		"anullsrc=channel_layout=stereo:sample_rate=48000",
+		"-c:v libx264",
+		"-c:a aac",
+		"-f mp4",
+		videoPath,
+	} {
+		if !strings.Contains(string(ffmpegLog), want) {
+			t.Errorf("FFmpeg invocation does not contain %q:\n%s", want, ffmpegLog)
+		}
+	}
+	for _, want := range []string{"Edit Plan:", planPath, "Finished Video:", videoPath} {
+		if !strings.Contains(output, want) {
+			t.Errorf("output does not contain %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestEditPlanOnlyAndOutputSafety(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir := t.TempDir()
+	sourceDir := filepath.Join(workingDir, "weekend")
+	if err := os.Mkdir(sourceDir, 0o755); err != nil {
+		t.Fatalf("create source directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "clip.mkv"), []byte("fixture"), 0o644); err != nil {
+		t.Fatalf("write Source Clip: %v", err)
+	}
+
+	toolDir := createEditTools(t)
+	logPath := filepath.Join(workingDir, "ffmpeg.log")
+	env := append(os.Environ(), "PATH="+toolDir, "AVE_TEST_FFMPEG_LOG="+logPath)
+	outputPath := filepath.Join(workingDir, "custom.mp4")
+	planPath := filepath.Join(workingDir, "custom.plan.json")
+
+	status, output := runCLIInDir(
+		t,
+		binary,
+		workingDir,
+		env,
+		"edit",
+		sourceDir,
+		"--output",
+		outputPath,
+		"--plan-only",
+	)
+	if status != 0 {
+		t.Fatalf("plan-only status = %d, want 0\noutput:\n%s", status, output)
+	}
+	if _, err := os.Stat(planPath); err != nil {
+		t.Fatalf("expected Edit Plan: %v", err)
+	}
+	if _, err := os.Stat(outputPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Finished Video exists after plan-only run: %v", err)
+	}
+	if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("FFmpeg was invoked during plan-only run: %v", err)
+	}
+	if !strings.Contains(output, "Edit Plan: "+planPath) || strings.Contains(output, "Finished Video:") {
+		t.Errorf("unexpected plan-only output:\n%s", output)
+	}
+
+	status, output = runCLIInDir(
+		t,
+		binary,
+		workingDir,
+		env,
+		"edit",
+		sourceDir,
+		"--output",
+		outputPath,
+		"--plan-only",
+	)
+	if status != 1 {
+		t.Fatalf("overwrite status = %d, want 1\noutput:\n%s", status, output)
+	}
+	if !strings.Contains(output, "refusing to overwrite existing artifact") || !strings.Contains(output, "--force") {
+		t.Errorf("overwrite failure is not actionable:\n%s", output)
+	}
+
+	if err := os.Remove(planPath); err != nil {
+		t.Fatalf("remove Edit Plan: %v", err)
+	}
+	if err := os.WriteFile(outputPath, []byte("existing video"), 0o644); err != nil {
+		t.Fatalf("write existing Finished Video: %v", err)
+	}
+	status, output = runCLIInDir(
+		t,
+		binary,
+		workingDir,
+		env,
+		"edit",
+		sourceDir,
+		"--output",
+		outputPath,
+		"--plan-only",
+	)
+	if status != 1 {
+		t.Fatalf("plan-only video overwrite status = %d, want 1\noutput:\n%s", status, output)
+	}
+	if !strings.Contains(output, "refusing to overwrite existing artifact") || !strings.Contains(output, outputPath) {
+		t.Errorf("plan-only video overwrite failure is not actionable:\n%s", output)
+	}
+
+	status, output = runCLIInDir(
+		t,
+		binary,
+		workingDir,
+		env,
+		"edit",
+		sourceDir,
+		"--output",
+		outputPath,
+		"--force",
+	)
+	if status != 0 {
+		t.Fatalf("forced render status = %d, want 0\noutput:\n%s", status, output)
+	}
+	if _, err := os.Stat(outputPath); err != nil {
+		t.Errorf("expected forced Finished Video: %v", err)
+	}
+	if !strings.Contains(output, "Finished Video: "+outputPath) {
+		t.Errorf("forced render output omits Finished Video:\n%s", output)
+	}
+
+	sourcePath := filepath.Join(sourceDir, "clip.mkv")
+	status, output = runCLIInDir(
+		t,
+		binary,
+		workingDir,
+		env,
+		"edit",
+		sourceDir,
+		"--output",
+		sourcePath,
+		"--force",
+	)
+	if status != 1 {
+		t.Fatalf("source collision status = %d, want 1\noutput:\n%s", status, output)
+	}
+	if !strings.Contains(output, "output artifact must not overwrite Source Clip") {
+		t.Errorf("source collision failure is not actionable:\n%s", output)
+	}
+}
+
+func TestEditCanForceReplaceItsOwnOutputInsideSourceFolder(t *testing.T) {
+	binary := buildCLI(t)
+	sourceDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(sourceDir, "clip.mov"), []byte("fixture"), 0o644); err != nil {
+		t.Fatalf("write Source Clip: %v", err)
+	}
+	toolDir := createEditTools(t)
+	env := append(
+		os.Environ(),
+		"PATH="+toolDir,
+		"AVE_TEST_FFMPEG_LOG="+filepath.Join(sourceDir, "ffmpeg.log"),
+	)
+
+	status, output := runCLIInDir(t, binary, sourceDir, env, "edit", ".")
+	if status != 0 {
+		t.Fatalf("first edit status = %d, want 0\noutput:\n%s", status, output)
+	}
+	status, output = runCLIInDir(t, binary, sourceDir, env, "edit", ".", "--force")
+	if status != 0 {
+		t.Fatalf("forced edit status = %d, want 0\noutput:\n%s", status, output)
+	}
+
+	planPath := filepath.Join(sourceDir, filepath.Base(sourceDir)+"-edit.plan.json")
+	data, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read replaced Edit Plan: %v", err)
+	}
+	var plan struct {
+		Segments []struct {
+			SourcePath string `json:"source_path"`
+		} `json:"selected_segments"`
+	}
+	if err := json.Unmarshal(data, &plan); err != nil {
+		t.Fatalf("decode replaced Edit Plan: %v", err)
+	}
+	if len(plan.Segments) != 1 || filepath.Base(plan.Segments[0].SourcePath) != "clip.mov" {
+		t.Errorf("forced rerun selected generated output: %+v", plan.Segments)
+	}
+}
+
+func TestEditUsesAvailableVideoToolboxEncoder(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir := t.TempDir()
+	sourceDir := filepath.Join(workingDir, "source")
+	if err := os.Mkdir(sourceDir, 0o755); err != nil {
+		t.Fatalf("create source folder: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "clip.mov"), []byte("fixture"), 0o644); err != nil {
+		t.Fatalf("write Source Clip: %v", err)
+	}
+	logPath := filepath.Join(workingDir, "ffmpeg.log")
+	env := append(
+		os.Environ(),
+		"PATH="+createEditTools(t),
+		"AVE_TEST_FFMPEG_LOG="+logPath,
+		"AVE_TEST_H264_ENCODER=videotoolbox",
+	)
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir)
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+	ffmpegLog, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read FFmpeg log: %v", err)
+	}
+	if !strings.Contains(string(ffmpegLog), "-c:v h264_videotoolbox") {
+		t.Errorf("FFmpeg did not use available VideoToolbox encoder:\n%s", ffmpegLog)
+	}
+
+	planPath := filepath.Join(workingDir, "source-edit.plan.json")
+	var plan struct {
+		Render struct {
+			VideoCodec string `json:"video_codec"`
+		} `json:"render"`
+	}
+	data, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read Edit Plan: %v", err)
+	}
+	if err := json.Unmarshal(data, &plan); err != nil {
+		t.Fatalf("decode Edit Plan: %v", err)
+	}
+	if plan.Render.VideoCodec != "h264_videotoolbox" {
+		t.Errorf("plan video codec = %q, want h264_videotoolbox", plan.Render.VideoCodec)
+	}
+}
+
+func TestEditDoesNotTrustStalePlanOutputOwnership(t *testing.T) {
+	binary := buildCLI(t)
+	sourceDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(sourceDir, "clip.mov"), []byte("fixture"), 0o644); err != nil {
+		t.Fatalf("write Source Clip: %v", err)
+	}
+	toolDir := createEditTools(t)
+	env := append(
+		os.Environ(),
+		"PATH="+toolDir,
+		"AVE_TEST_FFMPEG_LOG="+filepath.Join(sourceDir, "ffmpeg.log"),
+	)
+
+	status, output := runCLIInDir(t, binary, sourceDir, env, "edit", ".")
+	if status != 0 {
+		t.Fatalf("first edit status = %d, want 0\noutput:\n%s", status, output)
+	}
+	videoPath := filepath.Join(sourceDir, filepath.Base(sourceDir)+"-edit.mp4")
+	const replacement = "user replacement"
+	if err := os.WriteFile(videoPath, []byte(replacement), 0o644); err != nil {
+		t.Fatalf("replace prior Finished Video: %v", err)
+	}
+
+	status, output = runCLIInDir(t, binary, sourceDir, env, "edit", ".", "--force")
+	if status != 1 {
+		t.Fatalf("stale ownership status = %d, want 1\noutput:\n%s", status, output)
+	}
+	if !strings.Contains(output, "output artifact must not overwrite Source Clip") {
+		t.Errorf("stale ownership failure is not actionable:\n%s", output)
+	}
+	data, err := os.ReadFile(videoPath)
+	if err != nil {
+		t.Fatalf("read replacement video: %v", err)
+	}
+	if string(data) != replacement {
+		t.Errorf("replacement video was overwritten: %q", data)
+	}
+}
+
+func TestEditRejectsInvalidInputs(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir := t.TempDir()
+	emptyDir := filepath.Join(workingDir, "empty")
+	if err := os.Mkdir(emptyDir, 0o755); err != nil {
+		t.Fatalf("create empty directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(emptyDir, "notes.txt"), []byte("not video"), 0o644); err != nil {
+		t.Fatalf("write non-video fixture: %v", err)
+	}
+	notDirectory := filepath.Join(workingDir, "clip.mp4")
+	if err := os.WriteFile(notDirectory, []byte("fixture"), 0o644); err != nil {
+		t.Fatalf("write file fixture: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		args       []string
+		wantStatus int
+		wantOutput string
+	}{
+		{
+			name:       "unknown option",
+			args:       []string{"edit", emptyDir, "--unknown"},
+			wantStatus: 2,
+			wantOutput: `unknown edit option "--unknown"`,
+		},
+		{
+			name:       "output requires path",
+			args:       []string{"edit", emptyDir, "--output"},
+			wantStatus: 2,
+			wantOutput: "--output requires a file path",
+		},
+		{
+			name:       "only one source folder",
+			args:       []string{"edit", emptyDir, workingDir},
+			wantStatus: 2,
+			wantOutput: "edit accepts one source folder",
+		},
+		{
+			name:       "source must be folder",
+			args:       []string{"edit", notDirectory},
+			wantStatus: 1,
+			wantOutput: "source path is not a folder",
+		},
+		{
+			name:       "folder needs supported clips",
+			args:       []string{"edit", emptyDir},
+			wantStatus: 1,
+			wantOutput: "no supported Source Clips found",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			status, output := runCLIInDir(t, binary, workingDir, os.Environ(), test.args...)
+			if status != test.wantStatus {
+				t.Fatalf("status = %d, want %d\noutput:\n%s", status, test.wantStatus, output)
+			}
+			if !strings.Contains(output, test.wantOutput) {
+				t.Errorf("output does not contain %q:\n%s", test.wantOutput, output)
+			}
+		})
+	}
+}
+
+func TestEditReportsProbeFailures(t *testing.T) {
+	binary := buildCLI(t)
+	toolDir := createEditTools(t)
+
+	tests := []struct {
+		name       string
+		mode       string
+		wantStatus int
+		wantOutput string
+	}{
+		{
+			name:       "ffprobe command fails",
+			mode:       "fail",
+			wantStatus: 1,
+			wantOutput: "probe Source Clip",
+		},
+		{
+			name:       "ffprobe returns malformed JSON",
+			mode:       "malformed",
+			wantStatus: 1,
+			wantOutput: "decode ffprobe response",
+		},
+		{
+			name:       "ffprobe returns invalid duration",
+			mode:       "invalid-duration",
+			wantStatus: 1,
+			wantOutput: `invalid duration "0"`,
+		},
+		{
+			name:       "ffprobe returns malformed duration",
+			mode:       "malformed-duration",
+			wantStatus: 1,
+			wantOutput: `parse duration "unknown"`,
+		},
+		{
+			name:       "missing capture timestamp uses file modification time",
+			mode:       "missing-capture",
+			wantStatus: 0,
+			wantOutput: "Edit Plan:",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workingDir := t.TempDir()
+			sourceDir := filepath.Join(workingDir, "source")
+			if err := os.Mkdir(sourceDir, 0o755); err != nil {
+				t.Fatalf("create source folder: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(sourceDir, "clip.mov"), []byte("fixture"), 0o644); err != nil {
+				t.Fatalf("write Source Clip: %v", err)
+			}
+			env := append(os.Environ(), "PATH="+toolDir, "AVE_TEST_FFPROBE_MODE="+test.mode)
+
+			status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+			if status != test.wantStatus {
+				t.Fatalf("status = %d, want %d\noutput:\n%s", status, test.wantStatus, output)
+			}
+			if !strings.Contains(output, test.wantOutput) {
+				t.Errorf("output does not contain %q:\n%s", test.wantOutput, output)
+			}
+		})
+	}
+}
 
 func TestCLICommandContracts(t *testing.T) {
 	binary := buildCLI(t)
@@ -85,7 +592,7 @@ func TestCLICommandContracts(t *testing.T) {
 			name:       "quiet mode still reports command errors",
 			args:       []string{"edit", "clips", "--quiet"},
 			wantStatus: 1,
-			wantOutput: []string{"edit is not implemented yet"},
+			wantOutput: []string{"edit failed"},
 		},
 	}
 
@@ -327,8 +834,14 @@ func runCLI(t *testing.T, binary string, args ...string) (int, string) {
 
 func runCLIWithEnv(t *testing.T, binary string, env []string, args ...string) (int, string) {
 	t.Helper()
+	return runCLIInDir(t, binary, "", env, args...)
+}
+
+func runCLIInDir(t *testing.T, binary, dir string, env []string, args ...string) (int, string) {
+	t.Helper()
 
 	command := exec.Command(binary, args...)
+	command.Dir = dir
 	if coverageDir := os.Getenv("AVE_COVER_DIR"); coverageDir != "" {
 		env = append(env, "GOCOVERDIR="+coverageDir)
 	}
@@ -345,6 +858,45 @@ func runCLIWithEnv(t *testing.T, binary string, env []string, args ...string) (i
 		t.Fatalf("run CLI: %v", err)
 	}
 	return exitErr.ExitCode(), output.String()
+}
+
+func createEditTools(t *testing.T) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	writeExecutable(t, dir, "ffprobe", `#!/bin/sh
+case "$AVE_TEST_FFPROBE_MODE" in
+  fail) exit 1 ;;
+  malformed) printf 'not-json\n'; exit ;;
+  invalid-duration) printf '{"format":{"duration":"0"}}\n'; exit ;;
+  malformed-duration) printf '{"format":{"duration":"unknown"}}\n'; exit ;;
+  missing-capture) printf '{"format":{"duration":"4.5","tags":{}}}\n'; exit ;;
+esac
+for source do :; done
+case "$source" in
+  *earlier*) captured="2026-01-01T10:00:00Z" ;;
+  *later*) captured="2026-01-01T11:00:00Z" ;;
+  *) captured="2026-01-01T10:00:00Z" ;;
+esac
+printf '{"format":{"duration":"4.5","tags":{"creation_time":"%s"}}}\n' "$captured"
+`)
+	writeExecutable(t, dir, "ffmpeg", `#!/bin/sh
+case "$*" in
+  *"-encoders"*)
+    if [ "$AVE_TEST_H264_ENCODER" = "videotoolbox" ]; then
+      echo "V....D h264_videotoolbox"
+    else
+      echo "V....D libx264"
+    fi
+    echo "A....D aac"
+    exit
+    ;;
+esac
+printf '%s\n' "$*" > "$AVE_TEST_FFMPEG_LOG"
+for output do :; done
+printf 'finished video' > "$output"
+`)
+	return dir
 }
 
 func createFakeTools(t *testing.T, includeOptional bool) string {
