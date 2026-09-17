@@ -54,9 +54,10 @@ type Plan struct {
 
 // SelectedSegment identifies a source range included in an Edit Plan.
 type SelectedSegment struct {
-	SourcePath  string  `json:"source_path"`
-	StartSecond float64 `json:"start_seconds"`
-	EndSecond   float64 `json:"end_seconds"`
+	SourcePath        string  `json:"source_path"`
+	SourceFingerprint string  `json:"source_fingerprint,omitempty"`
+	StartSecond       float64 `json:"start_seconds"`
+	EndSecond         float64 `json:"end_seconds"`
 }
 
 // RenderSettings describes the baseline Finished Video encoding.
@@ -72,6 +73,46 @@ type RenderSettings struct {
 	AudioChannels      int    `json:"audio_channels"`
 	AudioChannelLayout string `json:"audio_channel_layout"`
 	FastStart          bool   `json:"fast_start"`
+}
+
+// validate reports whether the render settings are complete enough to drive
+// FFmpeg, guarding rerenders against malformed Edit Plans.
+func (settings RenderSettings) validate() error {
+	missing := make([]string, 0)
+	if settings.Container == "" {
+		missing = append(missing, "container")
+	}
+	if settings.VideoCodec == "" {
+		missing = append(missing, "video_codec")
+	}
+	if settings.AudioCodec == "" {
+		missing = append(missing, "audio_codec")
+	}
+	if settings.PixelFormat == "" {
+		missing = append(missing, "pixel_format")
+	}
+	if settings.AudioChannelLayout == "" {
+		missing = append(missing, "audio_channel_layout")
+	}
+	if settings.VideoWidth <= 0 {
+		missing = append(missing, "video_width")
+	}
+	if settings.VideoHeight <= 0 {
+		missing = append(missing, "video_height")
+	}
+	if settings.VideoFrameRate <= 0 {
+		missing = append(missing, "video_frame_rate")
+	}
+	if settings.AudioSampleRate <= 0 {
+		missing = append(missing, "audio_sample_rate")
+	}
+	if settings.AudioChannels <= 0 {
+		missing = append(missing, "audio_channels")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("incomplete Edit Plan render settings: %s", strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 type sourceClip struct {
@@ -136,12 +177,18 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		return clips[left].capturedAt.Before(clips[right].capturedAt)
 	})
 
-	segments := make([]SelectedSegment, 0, len(sourcePaths))
+	segments := make([]SelectedSegment, 0, len(clips))
+	planDir := filepath.Dir(result.PlanPath)
 	for _, clip := range clips {
+		fingerprint, fingerprintErr := sourceFingerprint(clip.path)
+		if fingerprintErr != nil {
+			return Result{}, fingerprintErr
+		}
 		segments = append(segments, SelectedSegment{
-			SourcePath:  clip.path,
-			StartSecond: 0,
-			EndSecond:   clip.duration,
+			SourcePath:        planRelativePath(planDir, clip.path),
+			SourceFingerprint: fingerprint,
+			StartSecond:       0,
+			EndSecond:         clip.duration,
 		})
 	}
 
@@ -453,57 +500,11 @@ func render(
 	settings RenderSettings,
 	force bool,
 ) error {
-	args := []string{"-hide_banner", "-loglevel", "error"}
-	var totalDuration float64
-	for _, clip := range clips {
-		args = append(args, "-i", clip.path)
-		totalDuration += clip.duration
+	inputs := make([]renderInput, len(clips))
+	for index, clip := range clips {
+		inputs[index] = renderInput{path: clip.path, start: 0, end: clip.duration}
 	}
-	args = append(
-		args,
-		"-f", "lavfi",
-		"-i", fmt.Sprintf(
-			"anullsrc=channel_layout=%s:sample_rate=%d",
-			settings.AudioChannelLayout,
-			settings.AudioSampleRate,
-		),
-	)
-
-	var filter strings.Builder
-	for index := range clips {
-		fmt.Fprintf(
-			&filter,
-			"[%d:v:0]setpts=PTS-STARTPTS,scale=%d:%d:force_original_aspect_ratio=decrease,"+
-				"pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=%d,format=%s[v%d];",
-			index,
-			settings.VideoWidth,
-			settings.VideoHeight,
-			settings.VideoWidth,
-			settings.VideoHeight,
-			settings.VideoFrameRate,
-			settings.PixelFormat,
-			index,
-		)
-	}
-	for index := range clips {
-		fmt.Fprintf(&filter, "[v%d]", index)
-	}
-	fmt.Fprintf(&filter, "concat=n=%d:v=1:a=0[video]", len(clips))
-
-	args = append(args,
-		"-filter_complex", filter.String(),
-		"-map", "[video]",
-		"-map", fmt.Sprintf("%d:a:0", len(clips)),
-		"-t", strconv.FormatFloat(totalDuration, 'f', 6, 64),
-		"-c:v", settings.VideoCodec,
-		"-pix_fmt", settings.PixelFormat,
-		"-c:a", settings.AudioCodec,
-		"-ar", strconv.Itoa(settings.AudioSampleRate),
-		"-ac", strconv.Itoa(settings.AudioChannels),
-	)
-	if settings.FastStart {
-		args = append(args, "-movflags", "+faststart")
-	}
+	args := encodeArgs(inputs, settings)
 	if force {
 		args = append(args, "-y")
 	} else {
@@ -516,6 +517,120 @@ func render(
 		return fmt.Errorf("render Finished Video: %s: %w", strings.TrimSpace(string(output)), err)
 	}
 	return nil
+}
+
+// renderInput is a resolved Source Clip range to include in a Finished Video.
+type renderInput struct {
+	path  string
+	start float64
+	end   float64
+}
+
+// encodeArgs builds the FFmpeg arguments common to every render, excluding the
+// trailing overwrite flag and output path. Source metadata is discarded so that
+// location, device, and capture details never reach the Finished Video.
+func encodeArgs(inputs []renderInput, settings RenderSettings) []string {
+	args := []string{"-hide_banner", "-loglevel", "error"}
+	var totalDuration float64
+	for _, input := range inputs {
+		args = append(args, "-i", input.path)
+		totalDuration += input.end - input.start
+	}
+	args = append(
+		args,
+		"-f", "lavfi",
+		"-i", fmt.Sprintf(
+			"anullsrc=channel_layout=%s:sample_rate=%d",
+			settings.AudioChannelLayout,
+			settings.AudioSampleRate,
+		),
+	)
+
+	var filter strings.Builder
+	for index, input := range inputs {
+		fmt.Fprintf(
+			&filter,
+			"[%d:v:0]trim=start=%s:end=%s,setpts=PTS-STARTPTS,"+
+				"scale=%d:%d:force_original_aspect_ratio=decrease,"+
+				"pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=%d,format=%s[v%d];",
+			index,
+			strconv.FormatFloat(input.start, 'f', 6, 64),
+			strconv.FormatFloat(input.end, 'f', 6, 64),
+			settings.VideoWidth,
+			settings.VideoHeight,
+			settings.VideoWidth,
+			settings.VideoHeight,
+			settings.VideoFrameRate,
+			settings.PixelFormat,
+			index,
+		)
+	}
+	for index := range inputs {
+		fmt.Fprintf(&filter, "[v%d]", index)
+	}
+	fmt.Fprintf(&filter, "concat=n=%d:v=1:a=0[video]", len(inputs))
+
+	args = append(args,
+		"-filter_complex", filter.String(),
+		"-map", "[video]",
+		"-map", fmt.Sprintf("%d:a:0", len(inputs)),
+		"-t", strconv.FormatFloat(totalDuration, 'f', 6, 64),
+		"-map_metadata", "-1",
+		"-c:v", settings.VideoCodec,
+		"-pix_fmt", settings.PixelFormat,
+		"-c:a", settings.AudioCodec,
+		"-ar", strconv.Itoa(settings.AudioSampleRate),
+		"-ac", strconv.Itoa(settings.AudioChannels),
+	)
+	if settings.FastStart {
+		args = append(args, "-movflags", "+faststart")
+	}
+	return args
+}
+
+// fingerprintSampleSize bounds how much of each Source Clip is hashed so that
+// identity checks stay fast on multi-gigabyte footage.
+const fingerprintSampleSize = 4 << 20
+
+// planRelativePath expresses target relative to planDir when possible so that a
+// project directory can be moved with its media, falling back to the absolute
+// path when no relative form exists.
+func planRelativePath(planDir, target string) string {
+	rel, err := filepath.Rel(planDir, target)
+	if err != nil {
+		return target
+	}
+	return rel
+}
+
+// sourceFingerprint derives a fast, content-derived identity for a Source Clip
+// from its size and hashed head and tail samples. A missing file yields an
+// error satisfying errors.Is(err, os.ErrNotExist).
+func sourceFingerprint(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("inspect Source Clip %s: %w", path, err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open Source Clip %s: %w", path, err)
+	}
+	hash := sha256.New()
+	if _, err := io.CopyN(hash, file, fingerprintSampleSize); err != nil && !errors.Is(err, io.EOF) {
+		return "", closeWithError(file, fmt.Errorf("read Source Clip %s: %w", path, err))
+	}
+	if info.Size() > fingerprintSampleSize {
+		if _, err := file.Seek(-fingerprintSampleSize, io.SeekEnd); err != nil {
+			return "", closeWithError(file, fmt.Errorf("seek Source Clip %s: %w", path, err))
+		}
+		if _, err := io.CopyN(hash, file, fingerprintSampleSize); err != nil && !errors.Is(err, io.EOF) {
+			return "", closeWithError(file, fmt.Errorf("read Source Clip %s: %w", path, err))
+		}
+	}
+	if err := file.Close(); err != nil {
+		return "", fmt.Errorf("close Source Clip %s: %w", path, err)
+	}
+	return fmt.Sprintf("v1:%d:%x", info.Size(), hash.Sum(nil)), nil
 }
 
 func closeWithError(file *os.File, prior error) error {
