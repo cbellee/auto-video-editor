@@ -123,7 +123,7 @@ func verifyPlanSources(plan Plan, baseDir string) ([]renderInput, error) {
 			problems = append(problems, fmt.Sprintf("%s: Source Clip changed since the Edit Plan was created", segment.SourcePath))
 			continue
 		}
-		inputs = append(inputs, renderInput{path: resolved, start: segment.StartSecond, end: segment.EndSecond})
+		inputs = append(inputs, renderInput{path: resolved, start: segment.StartSecond, end: segment.EndSecond, isHDR: segment.SourceIsHDR})
 	}
 	if len(problems) > 0 {
 		return nil, fmt.Errorf(
