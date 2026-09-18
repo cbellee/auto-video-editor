@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/cbellee/auto-video-editor/internal/edit"
@@ -14,7 +15,7 @@ const (
 	exitSuccess = 0
 	exitFailure = 1
 	exitUsage   = 2
-	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force]\n"
+	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force] [--fps <24|25|30|60>] [--aspect <landscape|portrait>]\n"
 	renderUsage = "usage: ave render <plan.json> [--media-root <dir>] [--force]\n"
 )
 
@@ -26,8 +27,10 @@ const (
 	outputQuiet
 )
 
-// Run executes ave with args and returns a process exit code.
-func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+// Run executes ave with args and returns a process exit code. stdin supplies
+// interactive prompt answers and interactive reports whether stdin is a
+// terminal, so orientation ties can be resolved without blocking scripts.
+func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, interactive bool) int {
 	args, mode, err := parseOutputMode(args)
 	if err != nil {
 		return writeExitCode(stderr, exitUsage, "%v\n", err)
@@ -41,7 +44,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	case "-h", "--help", "help":
 		return helpExitCode(stdout)
 	case "edit":
-		return runEdit(ctx, args[1:], mode, stdout, stderr)
+		return runEdit(ctx, args[1:], mode, stdin, stdout, stderr, interactive)
 	case "render":
 		return runRender(ctx, args[1:], mode, stdout, stderr)
 	case "doctor":
@@ -63,7 +66,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-func runEdit(ctx context.Context, args []string, mode outputMode, stdout, stderr io.Writer) int {
+func runEdit(ctx context.Context, args []string, mode outputMode, stdin io.Reader, stdout, stderr io.Writer, interactive bool) int {
 	if hasHelp(args) {
 		return writeExitCode(stdout, exitSuccess, editUsage)
 	}
@@ -77,6 +80,9 @@ func runEdit(ctx context.Context, args []string, mode outputMode, stdout, stderr
 			editUsage,
 		)
 	}
+	options.Interactive = interactive
+	options.Stdin = stdin
+	options.Prompt = stderr
 
 	result, err := edit.Run(ctx, options)
 	if err != nil {
@@ -107,6 +113,22 @@ func parseEditOptions(args []string) (edit.Options, error) {
 				return edit.Options{}, fmt.Errorf("--output requires a file path")
 			}
 			options.Output = args[index]
+		case "--fps":
+			index++
+			if index >= len(args) || strings.HasPrefix(args[index], "-") {
+				return edit.Options{}, fmt.Errorf("--fps requires a frame rate")
+			}
+			fps, convErr := strconv.Atoi(args[index])
+			if convErr != nil {
+				return edit.Options{}, fmt.Errorf("invalid --fps value %q; use 24, 25, 30, or 60", args[index])
+			}
+			options.FrameRate = fps
+		case "--aspect":
+			index++
+			if index >= len(args) || strings.HasPrefix(args[index], "-") {
+				return edit.Options{}, fmt.Errorf("--aspect requires landscape or portrait")
+			}
+			options.Aspect = args[index]
 		default:
 			if strings.HasPrefix(args[index], "-") {
 				return edit.Options{}, fmt.Errorf("unknown edit option %q", args[index])

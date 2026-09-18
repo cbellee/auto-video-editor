@@ -2,6 +2,7 @@
 package edit
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -21,6 +22,10 @@ import (
 
 const planVersion = "1"
 
+// minUsableSeconds is the hard floor below which an edit fails rather than
+// claiming success with a meaningless result.
+const minUsableSeconds = 5.0
+
 var supportedExtensions = map[string]bool{
 	".avi": true,
 	".mkv": true,
@@ -34,6 +39,36 @@ type Options struct {
 	Output    string
 	PlanOnly  bool
 	Force     bool
+	// FrameRate is the output frame rate; 0 selects the 30 fps default.
+	FrameRate int
+	// Aspect forces output orientation ("landscape" or "portrait"); empty
+	// selects orientation from the majority usable-footage duration.
+	Aspect string
+	// Interactive allows prompting to resolve an orientation tie.
+	Interactive bool
+	// Stdin supplies interactive prompt answers; Prompt receives prompt text.
+	Stdin  io.Reader
+	Prompt io.Writer
+}
+
+// allowedFrameRates enumerates the output frame rates the MVP supports.
+var allowedFrameRates = map[int]bool{24: true, 25: true, 30: true, 60: true}
+
+const defaultFrameRate = 30
+
+// orientation is the output framing derived from usable footage.
+type orientation int
+
+const (
+	orientationLandscape orientation = iota
+	orientationPortrait
+)
+
+func (o orientation) String() string {
+	if o == orientationPortrait {
+		return "portrait"
+	}
+	return "landscape"
 }
 
 // Result identifies the artifacts created by an edit.
@@ -49,13 +84,21 @@ type Plan struct {
 	FinishedVideo    string            `json:"finished_video"`
 	FinishedVideoSHA string            `json:"finished_video_sha256,omitempty"`
 	SelectedSegments []SelectedSegment `json:"selected_segments"`
+	Skipped          []SkippedClip     `json:"skipped,omitempty"`
 	Render           RenderSettings    `json:"render"`
+}
+
+// SkippedClip records a Source Clip that was excluded and why.
+type SkippedClip struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
 }
 
 // SelectedSegment identifies a source range included in an Edit Plan.
 type SelectedSegment struct {
 	SourcePath        string  `json:"source_path"`
 	SourceFingerprint string  `json:"source_fingerprint,omitempty"`
+	SourceIsHDR       bool    `json:"source_is_hdr,omitempty"`
 	StartSecond       float64 `json:"start_seconds"`
 	EndSecond         float64 `json:"end_seconds"`
 }
@@ -119,6 +162,17 @@ type sourceClip struct {
 	path       string
 	duration   float64
 	capturedAt time.Time
+	width      int
+	height     int
+	isHDR      bool
+}
+
+// orientation classifies the clip from its rotation-corrected dimensions.
+func (c sourceClip) orientation() orientation {
+	if c.height > c.width {
+		return orientationPortrait
+	}
+	return orientationLandscape
 }
 
 // Run creates a baseline Chronological Edit Plan and optionally renders it.
@@ -150,32 +204,54 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	if options.Force && priorPlanOwnsOutput(result.PlanPath, result.VideoPath) {
 		excludedPaths[result.VideoPath] = true
 	}
-	sourcePaths, err := sourceClips(sourceDir, excludedPaths)
+	supportedPaths, skipped, err := sourceClips(sourceDir, excludedPaths)
 	if err != nil {
 		return Result{}, err
 	}
-	if len(sourcePaths) == 0 {
+	warnSkipped(options.Prompt, skipped)
+	if len(supportedPaths) == 0 {
 		return Result{}, fmt.Errorf("no supported Source Clips found in %s", sourceDir)
 	}
 
-	if err := rejectSourceCollision(result, sourcePaths); err != nil {
-		return Result{}, err
-	}
-
-	clips := make([]sourceClip, 0, len(sourcePaths))
-	for _, sourcePath := range sourcePaths {
+	clips := make([]sourceClip, 0, len(supportedPaths))
+	for _, sourcePath := range supportedPaths {
 		clip, probeErr := probeSourceClip(ctx, sourcePath)
 		if probeErr != nil {
-			return Result{}, probeErr
+			reason := probeErr.Error()
+			skipped = append(skipped, SkippedClip{Path: sourcePath, Reason: reason})
+			warnSkipped(options.Prompt, []SkippedClip{{Path: sourcePath, Reason: reason}})
+			continue
 		}
 		clips = append(clips, clip)
 	}
+
+	var usableDuration float64
+	for _, clip := range clips {
+		usableDuration += clip.duration
+	}
+	if usableDuration < minUsableSeconds {
+		return Result{}, fmt.Errorf(
+			"less than five seconds of usable footage remains (%.2fs after skipping %d unusable clip(s))",
+			usableDuration,
+			len(skipped),
+		)
+	}
+
+	if err := rejectSourceCollision(result, clipPaths(clips)); err != nil {
+		return Result{}, err
+	}
+
 	sort.Slice(clips, func(left, right int) bool {
 		if clips[left].capturedAt.Equal(clips[right].capturedAt) {
-			return clips[left].path < clips[right].path
+			return filepath.Base(clips[left].path) < filepath.Base(clips[right].path)
 		}
 		return clips[left].capturedAt.Before(clips[right].capturedAt)
 	})
+
+	outputOrientation, err := selectOrientation(clips, options)
+	if err != nil {
+		return Result{}, err
+	}
 
 	segments := make([]SelectedSegment, 0, len(clips))
 	planDir := filepath.Dir(result.PlanPath)
@@ -187,12 +263,13 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		segments = append(segments, SelectedSegment{
 			SourcePath:        planRelativePath(planDir, clip.path),
 			SourceFingerprint: fingerprint,
+			SourceIsHDR:       clip.isHDR,
 			StartSecond:       0,
 			EndSecond:         clip.duration,
 		})
 	}
 
-	renderSettings, err := baselineRenderSettings(ctx)
+	renderSettings, err := renderSettingsFor(ctx, outputOrientation, options.FrameRate)
 	if err != nil {
 		return Result{}, err
 	}
@@ -201,6 +278,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		EditIntent:       "chronological",
 		FinishedVideo:    result.VideoPath,
 		SelectedSegments: segments,
+		Skipped:          skipped,
 		Render:           renderSettings,
 	}
 	if err := writePlan(result.PlanPath, plan, options.Force); err != nil {
@@ -228,23 +306,104 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	return result, nil
 }
 
-func sourceClips(sourceDir string, excludedPaths map[string]bool) ([]string, error) {
+func sourceClips(sourceDir string, excludedPaths map[string]bool) ([]string, []SkippedClip, error) {
 	entries, err := os.ReadDir(sourceDir)
 	if err != nil {
-		return nil, fmt.Errorf("read source folder: %w", err)
+		return nil, nil, fmt.Errorf("read source folder: %w", err)
 	}
 	paths := make([]string, 0, len(entries))
+	var skipped []SkippedClip
 	for _, entry := range entries {
-		if entry.IsDir() || !supportedExtensions[strings.ToLower(filepath.Ext(entry.Name()))] {
+		name := entry.Name()
+		if entry.IsDir() || strings.HasPrefix(name, ".") {
 			continue
 		}
-		path := filepath.Join(sourceDir, entry.Name())
+		path := filepath.Join(sourceDir, name)
+		if !supportedExtensions[strings.ToLower(filepath.Ext(name))] {
+			skipped = append(skipped, SkippedClip{Path: path, Reason: "unsupported file type"})
+			continue
+		}
 		if excludedPaths[path] {
 			continue
 		}
 		paths = append(paths, path)
 	}
-	return paths, nil
+	return paths, skipped, nil
+}
+
+// clipPaths returns the filesystem paths of the usable clips.
+func clipPaths(clips []sourceClip) []string {
+	paths := make([]string, len(clips))
+	for index, clip := range clips {
+		paths[index] = clip.path
+	}
+	return paths
+}
+
+// warnSkipped emits a prominent warning per skipped Source Clip so a mixed
+// folder does not silently drop footage.
+func warnSkipped(writer io.Writer, skipped []SkippedClip) {
+	if writer == nil {
+		return
+	}
+	for _, clip := range skipped {
+		_, _ = fmt.Fprintf(writer, "warning: skipping %s: %s\n", clip.Path, clip.Reason)
+	}
+}
+
+// selectOrientation chooses the Finished Video orientation from an explicit
+// aspect override or the majority usable-footage duration, resolving ties
+// interactively or by requiring an explicit aspect.
+func selectOrientation(clips []sourceClip, options Options) (orientation, error) {
+	switch options.Aspect {
+	case "landscape":
+		return orientationLandscape, nil
+	case "portrait":
+		return orientationPortrait, nil
+	case "":
+	default:
+		return orientationLandscape, fmt.Errorf("invalid aspect %q; use landscape or portrait", options.Aspect)
+	}
+
+	var landscapeDuration, portraitDuration float64
+	for _, clip := range clips {
+		if clip.orientation() == orientationPortrait {
+			portraitDuration += clip.duration
+		} else {
+			landscapeDuration += clip.duration
+		}
+	}
+	switch {
+	case portraitDuration > landscapeDuration:
+		return orientationPortrait, nil
+	case landscapeDuration > portraitDuration:
+		return orientationLandscape, nil
+	default:
+		return resolveOrientationTie(options)
+	}
+}
+
+// resolveOrientationTie prompts for an orientation when interactive, and
+// otherwise requires an explicit aspect so scripted runs stay deterministic.
+func resolveOrientationTie(options Options) (orientation, error) {
+	tieErr := fmt.Errorf("portrait and landscape footage are tied; pass --aspect landscape|portrait")
+	if !options.Interactive || options.Prompt == nil || options.Stdin == nil {
+		return orientationLandscape, tieErr
+	}
+	reader := bufio.NewReader(options.Stdin)
+	for {
+		_, _ = fmt.Fprint(options.Prompt, "Portrait and landscape footage are tied. Choose aspect [landscape/portrait]: ")
+		line, readErr := reader.ReadString('\n')
+		switch strings.ToLower(strings.TrimSpace(line)) {
+		case "landscape", "l":
+			return orientationLandscape, nil
+		case "portrait", "p":
+			return orientationPortrait, nil
+		}
+		if readErr != nil {
+			return orientationLandscape, tieErr
+		}
+	}
 }
 
 func priorPlanOwnsOutput(planPath, videoPath string) bool {
@@ -334,7 +493,10 @@ func probeSourceClip(ctx context.Context, sourcePath string) (sourceClip, error)
 		ctx,
 		"ffprobe",
 		"-v", "error",
-		"-show_entries", "format=duration:format_tags=creation_time",
+		"-select_streams", "v:0",
+		"-show_entries",
+		"stream=width,height,color_transfer:stream_tags=rotate:stream_side_data=rotation:"+
+			"format=duration:format_tags=creation_time",
 		"-of", "json",
 		sourcePath,
 	)
@@ -343,6 +505,17 @@ func probeSourceClip(ctx context.Context, sourcePath string) (sourceClip, error)
 		return sourceClip{}, fmt.Errorf("probe Source Clip %s: %w", sourcePath, err)
 	}
 	var response struct {
+		Streams []struct {
+			Width         int    `json:"width"`
+			Height        int    `json:"height"`
+			ColorTransfer string `json:"color_transfer"`
+			Tags          struct {
+				Rotate string `json:"rotate"`
+			} `json:"tags"`
+			SideDataList []struct {
+				Rotation int `json:"rotation"`
+			} `json:"side_data_list"`
+		} `json:"streams"`
 		Format struct {
 			Duration string `json:"duration"`
 			Tags     struct {
@@ -366,6 +539,13 @@ func probeSourceClip(ctx context.Context, sourcePath string) (sourceClip, error)
 		return sourceClip{}, fmt.Errorf("invalid duration %q for Source Clip %s", response.Format.Duration, sourcePath)
 	}
 
+	clip := sourceClip{path: sourcePath, duration: duration}
+	if len(response.Streams) > 0 {
+		stream := response.Streams[0]
+		clip.width, clip.height = displayDimensions(stream.Width, stream.Height, streamRotation(stream.SideDataList, stream.Tags.Rotate))
+		clip.isHDR = isHDRTransfer(stream.ColorTransfer)
+	}
+
 	capturedAt, err := time.Parse(time.RFC3339Nano, response.Format.Tags.CreationTime)
 	if err != nil {
 		info, statErr := os.Stat(sourcePath)
@@ -374,7 +554,45 @@ func probeSourceClip(ctx context.Context, sourcePath string) (sourceClip, error)
 		}
 		capturedAt = info.ModTime()
 	}
-	return sourceClip{path: sourcePath, duration: duration, capturedAt: capturedAt}, nil
+	clip.capturedAt = capturedAt
+	return clip, nil
+}
+
+// streamRotation resolves the display rotation in degrees from either the
+// display-matrix side data or the legacy rotate tag.
+func streamRotation(sideData []struct {
+	Rotation int `json:"rotation"`
+}, rotateTag string) int {
+	if len(sideData) > 0 {
+		return sideData[0].Rotation
+	}
+	if rotateTag != "" {
+		if rotation, err := strconv.Atoi(rotateTag); err == nil {
+			return rotation
+		}
+	}
+	return 0
+}
+
+// displayDimensions returns the width and height as displayed after applying a
+// quarter-turn rotation, so orientation follows what a viewer sees.
+func displayDimensions(width, height, rotation int) (int, int) {
+	normalized := ((rotation % 360) + 360) % 360
+	if normalized == 90 || normalized == 270 {
+		return height, width
+	}
+	return width, height
+}
+
+// isHDRTransfer reports whether a color transfer characteristic denotes HDR
+// (PQ or HLG), which requires tone mapping to SDR Rec.709.
+func isHDRTransfer(transfer string) bool {
+	switch transfer {
+	case "smpte2084", "arib-std-b67":
+		return true
+	default:
+		return false
+	}
 }
 
 func writePlan(path string, plan Plan, force bool) error {
@@ -458,7 +676,23 @@ func fileSHA256(path string) (string, error) {
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
-func baselineRenderSettings(ctx context.Context) (RenderSettings, error) {
+// canvasDimensions returns the 1080p-capped output dimensions for the chosen
+// orientation, preserving 16:9 (landscape) or 9:16 (portrait).
+func canvasDimensions(o orientation) (int, int) {
+	if o == orientationPortrait {
+		return 1080, 1920
+	}
+	return 1920, 1080
+}
+
+func renderSettingsFor(ctx context.Context, o orientation, frameRate int) (RenderSettings, error) {
+	if frameRate == 0 {
+		frameRate = defaultFrameRate
+	}
+	if !allowedFrameRates[frameRate] {
+		return RenderSettings{}, fmt.Errorf("unsupported frame rate %d; use 24, 25, 30, or 60", frameRate)
+	}
+
 	output, err := exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-encoders").CombinedOutput()
 	if err != nil {
 		return RenderSettings{}, fmt.Errorf(
@@ -470,21 +704,22 @@ func baselineRenderSettings(ctx context.Context) (RenderSettings, error) {
 	encoders := ffmpeg.CapabilityNames(string(output))
 	videoCodec := ""
 	switch {
-	case encoders["libx264"]:
-		videoCodec = "libx264"
 	case encoders["h264_videotoolbox"]:
 		videoCodec = "h264_videotoolbox"
+	case encoders["libx264"]:
+		videoCodec = "libx264"
 	default:
 		return RenderSettings{}, fmt.Errorf("FFmpeg does not provide a supported H.264 encoder")
 	}
 
+	width, height := canvasDimensions(o)
 	return RenderSettings{
 		Container:          "mp4",
 		VideoCodec:         videoCodec,
 		AudioCodec:         "aac",
-		VideoWidth:         1280,
-		VideoHeight:        720,
-		VideoFrameRate:     30,
+		VideoWidth:         width,
+		VideoHeight:        height,
+		VideoFrameRate:     frameRate,
 		PixelFormat:        "yuv420p",
 		AudioSampleRate:    48000,
 		AudioChannels:      2,
@@ -502,7 +737,7 @@ func render(
 ) error {
 	inputs := make([]renderInput, len(clips))
 	for index, clip := range clips {
-		inputs[index] = renderInput{path: clip.path, start: 0, end: clip.duration}
+		inputs[index] = renderInput{path: clip.path, start: 0, end: clip.duration, isHDR: clip.isHDR}
 	}
 	args := encodeArgs(inputs, settings)
 	if force {
@@ -524,11 +759,15 @@ type renderInput struct {
 	path  string
 	start float64
 	end   float64
+	isHDR bool
 }
 
 // encodeArgs builds the FFmpeg arguments common to every render, excluding the
 // trailing overwrite flag and output path. Source metadata is discarded so that
-// location, device, and capture details never reach the Finished Video.
+// location, device, and capture details never reach the Finished Video. Each
+// clip is fit onto the canvas without distortion and letterboxed with a blurred
+// copy of itself, HDR footage is tone mapped to SDR, and the result is tagged
+// Rec.709.
 func encodeArgs(inputs []renderInput, settings RenderSettings) []string {
 	args := []string{"-hide_banner", "-loglevel", "error"}
 	var totalDuration float64
@@ -548,18 +787,44 @@ func encodeArgs(inputs []renderInput, settings RenderSettings) []string {
 
 	var filter strings.Builder
 	for index, input := range inputs {
+		source := fmt.Sprintf("base%d", index)
 		fmt.Fprintf(
 			&filter,
-			"[%d:v:0]trim=start=%s:end=%s,setpts=PTS-STARTPTS,"+
-				"scale=%d:%d:force_original_aspect_ratio=decrease,"+
-				"pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=%d,format=%s[v%d];",
+			"[%d:v:0]trim=start=%s:end=%s,setpts=PTS-STARTPTS",
 			index,
 			strconv.FormatFloat(input.start, 'f', 6, 64),
 			strconv.FormatFloat(input.end, 'f', 6, 64),
+		)
+		if input.isHDR {
+			filter.WriteString(
+				",zscale=t=linear:npl=100,tonemap=hable,zscale=p=bt709:t=bt709:m=bt709:r=tv",
+			)
+		}
+		fmt.Fprintf(&filter, "[%s];", source)
+		fmt.Fprintf(&filter, "[%s]split=2[fg%d][bg%d];", source, index, index)
+		fmt.Fprintf(
+			&filter,
+			"[bg%d]scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,boxblur=20:1,setsar=1[bgb%d];",
+			index,
 			settings.VideoWidth,
 			settings.VideoHeight,
 			settings.VideoWidth,
 			settings.VideoHeight,
+			index,
+		)
+		fmt.Fprintf(
+			&filter,
+			"[fg%d]scale=%d:%d:force_original_aspect_ratio=decrease,setsar=1[fgs%d];",
+			index,
+			settings.VideoWidth,
+			settings.VideoHeight,
+			index,
+		)
+		fmt.Fprintf(
+			&filter,
+			"[bgb%d][fgs%d]overlay=(W-w)/2:(H-h)/2,fps=%d,format=%s[v%d];",
+			index,
+			index,
 			settings.VideoFrameRate,
 			settings.PixelFormat,
 			index,
@@ -578,6 +843,9 @@ func encodeArgs(inputs []renderInput, settings RenderSettings) []string {
 		"-map_metadata", "-1",
 		"-c:v", settings.VideoCodec,
 		"-pix_fmt", settings.PixelFormat,
+		"-color_primaries", "bt709",
+		"-color_trc", "bt709",
+		"-colorspace", "bt709",
 		"-c:a", settings.AudioCodec,
 		"-ar", strconv.Itoa(settings.AudioSampleRate),
 		"-ac", strconv.Itoa(settings.AudioChannels),

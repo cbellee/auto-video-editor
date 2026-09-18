@@ -93,15 +93,15 @@ func TestEditCreatesChronologicalPlanAndFinishedVideo(t *testing.T) {
 		t.Errorf("second Source Clip = %q, want 01-later.mp4", got)
 	}
 	for index, segment := range plan.Segments {
-		if segment.Start != 0 || segment.End != 4.5 {
-			t.Errorf("segment %d range = %.1f-%.1f, want 0.0-4.5", index, segment.Start, segment.End)
+		if segment.Start != 0 || segment.End != 6.0 {
+			t.Errorf("segment %d range = %.1f-%.1f, want 0.0-6.0", index, segment.Start, segment.End)
 		}
 	}
 	if plan.Render.Container != "mp4" ||
 		plan.Render.VideoCodec != "libx264" ||
 		plan.Render.AudioCodec != "aac" ||
-		plan.Render.VideoWidth != 1280 ||
-		plan.Render.VideoHeight != 720 ||
+		plan.Render.VideoWidth != 1920 ||
+		plan.Render.VideoHeight != 1080 ||
 		plan.Render.VideoFrameRate != 30 ||
 		plan.Render.PixelFormat != "yuv420p" ||
 		plan.Render.AudioSampleRate != 48000 ||
@@ -566,6 +566,277 @@ func TestEditReportsProbeFailures(t *testing.T) {
 				t.Errorf("output does not contain %q:\n%s", test.wantOutput, output)
 			}
 		})
+	}
+}
+
+// makeEditSource creates a source folder populated with the named fixtures.
+func makeEditSource(t *testing.T, names ...string) (string, string) {
+	t.Helper()
+	workingDir := t.TempDir()
+	sourceDir := filepath.Join(workingDir, "source")
+	if err := os.Mkdir(sourceDir, 0o755); err != nil {
+		t.Fatalf("create source folder: %v", err)
+	}
+	for _, name := range names {
+		if err := os.WriteFile(filepath.Join(sourceDir, name), []byte("fixture"), 0o644); err != nil {
+			t.Fatalf("write fixture %s: %v", name, err)
+		}
+	}
+	return workingDir, sourceDir
+}
+
+func decodeEditPlan(t *testing.T, planPath string) editPlanDocument {
+	t.Helper()
+	data, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read Edit Plan: %v", err)
+	}
+	var plan editPlanDocument
+	if err := json.Unmarshal(data, &plan); err != nil {
+		t.Fatalf("decode Edit Plan: %v", err)
+	}
+	return plan
+}
+
+type editPlanDocument struct {
+	Segments []struct {
+		SourcePath string `json:"source_path"`
+		IsHDR      bool   `json:"source_is_hdr"`
+	} `json:"selected_segments"`
+	Skipped []struct {
+		Path   string `json:"path"`
+		Reason string `json:"reason"`
+	} `json:"skipped"`
+	Render struct {
+		VideoCodec     string `json:"video_codec"`
+		VideoWidth     int    `json:"video_width"`
+		VideoHeight    int    `json:"video_height"`
+		VideoFrameRate int    `json:"video_frame_rate"`
+	} `json:"render"`
+}
+
+func TestEditSkipsUnsupportedAndCorruptClipsWithWarnings(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "good.mp4", "broken-corrupt.mp4", "notes.txt")
+	toolDir := createEditTools(t)
+	env := append(os.Environ(), "PATH="+toolDir)
+
+	planPath := filepath.Join(sourceDir, "..", "source-edit.plan.json")
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+	for _, want := range []string{
+		"warning: skipping",
+		"broken-corrupt.mp4",
+		"notes.txt",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("output does not contain %q:\n%s", want, output)
+		}
+	}
+
+	plan := decodeEditPlan(t, filepath.Clean(planPath))
+	if len(plan.Segments) != 1 || filepath.Base(plan.Segments[0].SourcePath) != "good.mp4" {
+		t.Fatalf("segments = %+v, want only good.mp4", plan.Segments)
+	}
+	reasons := map[string]string{}
+	for _, skip := range plan.Skipped {
+		reasons[filepath.Base(skip.Path)] = skip.Reason
+	}
+	if reasons["notes.txt"] != "unsupported file type" {
+		t.Errorf("notes.txt reason = %q, want unsupported file type", reasons["notes.txt"])
+	}
+	if reasons["broken-corrupt.mp4"] == "" {
+		t.Errorf("expected recorded reason for broken-corrupt.mp4, got %+v", plan.Skipped)
+	}
+}
+
+func TestEditFailsWhenUsableFootageBelowFloor(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "one-corrupt.mp4", "two-corrupt.mov")
+	env := append(os.Environ(), "PATH="+createEditTools(t))
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status != 1 {
+		t.Fatalf("status = %d, want 1\noutput:\n%s", status, output)
+	}
+	if !strings.Contains(output, "less than five seconds of usable footage") {
+		t.Errorf("output does not report the five second floor:\n%s", output)
+	}
+}
+
+func TestEditOrientationFollowsPortraitMajority(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "a-portrait.mp4", "b-portrait.mp4", "c-landscape.mp4")
+	planPath := filepath.Join(workingDir, "source-edit.plan.json")
+	env := append(os.Environ(), "PATH="+createEditTools(t))
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+	plan := decodeEditPlan(t, planPath)
+	if plan.Render.VideoWidth != 1080 || plan.Render.VideoHeight != 1920 {
+		t.Errorf("portrait majority canvas = %dx%d, want 1080x1920", plan.Render.VideoWidth, plan.Render.VideoHeight)
+	}
+}
+
+func TestEditAspectOverride(t *testing.T) {
+	binary := buildCLI(t)
+
+	t.Run("landscape overrides portrait footage", func(t *testing.T) {
+		workingDir, sourceDir := makeEditSource(t, "a-portrait.mp4", "b-portrait.mp4")
+		planPath := filepath.Join(workingDir, "source-edit.plan.json")
+		env := append(os.Environ(), "PATH="+createEditTools(t))
+		status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only", "--aspect", "landscape")
+		if status != 0 {
+			t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+		}
+		plan := decodeEditPlan(t, planPath)
+		if plan.Render.VideoWidth != 1920 || plan.Render.VideoHeight != 1080 {
+			t.Errorf("canvas = %dx%d, want 1920x1080", plan.Render.VideoWidth, plan.Render.VideoHeight)
+		}
+	})
+
+	t.Run("invalid aspect is rejected", func(t *testing.T) {
+		workingDir, sourceDir := makeEditSource(t, "a-landscape.mp4", "b-landscape.mp4")
+		env := append(os.Environ(), "PATH="+createEditTools(t))
+		status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only", "--aspect", "square")
+		if status != 1 {
+			t.Fatalf("status = %d, want 1\noutput:\n%s", status, output)
+		}
+		if !strings.Contains(output, "invalid aspect") {
+			t.Errorf("output does not report invalid aspect:\n%s", output)
+		}
+	})
+}
+
+func TestEditOrientationTieRequiresAspect(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "a-portrait.mp4", "b-landscape.mp4")
+	env := append(os.Environ(), "PATH="+createEditTools(t))
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status != 1 {
+		t.Fatalf("status = %d, want 1\noutput:\n%s", status, output)
+	}
+	if !strings.Contains(output, "pass --aspect landscape|portrait") {
+		t.Errorf("output does not require an explicit aspect:\n%s", output)
+	}
+}
+
+func TestEditRejectsUnsupportedFrameRate(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "a-landscape.mp4", "b-landscape.mp4")
+	env := append(os.Environ(), "PATH="+createEditTools(t))
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only", "--fps", "48")
+	if status == 0 {
+		t.Fatalf("status = %d, want non-zero\noutput:\n%s", status, output)
+	}
+	if !strings.Contains(output, "48") {
+		t.Errorf("output does not report the rejected frame rate:\n%s", output)
+	}
+}
+
+func TestEditHonorsFrameRateOverride(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "a-landscape.mp4", "b-landscape.mp4")
+	planPath := filepath.Join(workingDir, "source-edit.plan.json")
+	logPath := filepath.Join(workingDir, "ffmpeg.log")
+	env := append(os.Environ(), "PATH="+createEditTools(t), "AVE_TEST_FFMPEG_LOG="+logPath)
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--fps", "60")
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+	plan := decodeEditPlan(t, planPath)
+	if plan.Render.VideoFrameRate != 60 {
+		t.Errorf("frame rate = %d, want 60", plan.Render.VideoFrameRate)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read ffmpeg log: %v", err)
+	}
+	if !strings.Contains(string(log), "fps=60") {
+		t.Errorf("ffmpeg filter does not set fps=60:\n%s", log)
+	}
+}
+
+func TestEditRendersBlurredPaddingAndRec709(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "a-landscape.mp4", "b-landscape.mp4")
+	logPath := filepath.Join(workingDir, "ffmpeg.log")
+	env := append(os.Environ(), "PATH="+createEditTools(t), "AVE_TEST_FFMPEG_LOG="+logPath)
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir)
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read ffmpeg log: %v", err)
+	}
+	for _, want := range []string{
+		"boxblur",
+		"overlay=(W-w)/2:(H-h)/2",
+		"-color_primaries bt709",
+		"-color_trc bt709",
+		"-colorspace bt709",
+	} {
+		if !strings.Contains(string(log), want) {
+			t.Errorf("ffmpeg invocation missing %q:\n%s", want, log)
+		}
+	}
+	if strings.Contains(string(log), "pad=1920:1080") {
+		t.Errorf("expected blurred padding to replace black pad:\n%s", log)
+	}
+}
+
+func TestEditTonemapsHDRFootage(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "a-hdr-landscape.mp4", "b-landscape.mp4")
+	planPath := filepath.Join(workingDir, "source-edit.plan.json")
+	logPath := filepath.Join(workingDir, "ffmpeg.log")
+	env := append(os.Environ(), "PATH="+createEditTools(t), "AVE_TEST_FFMPEG_LOG="+logPath)
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir)
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read ffmpeg log: %v", err)
+	}
+	if !strings.Contains(string(log), "tonemap") {
+		t.Errorf("ffmpeg invocation does not tone map HDR footage:\n%s", log)
+	}
+	plan := decodeEditPlan(t, planPath)
+	var hdrPersisted bool
+	for _, segment := range plan.Segments {
+		if strings.Contains(segment.SourcePath, "hdr") && segment.IsHDR {
+			hdrPersisted = true
+		}
+	}
+	if !hdrPersisted {
+		t.Errorf("HDR flag not persisted for reproducible render:\n%+v", plan.Segments)
+	}
+}
+
+func TestEditPrefersVideoToolboxEncoder(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "a-landscape.mp4", "b-landscape.mp4")
+	planPath := filepath.Join(workingDir, "source-edit.plan.json")
+	env := append(os.Environ(), "PATH="+createEditTools(t), "AVE_TEST_H264_ENCODER=both")
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+	plan := decodeEditPlan(t, planPath)
+	if plan.Render.VideoCodec != "h264_videotoolbox" {
+		t.Errorf("video codec = %q, want h264_videotoolbox when both encoders exist", plan.Render.VideoCodec)
 	}
 }
 
@@ -1208,20 +1479,34 @@ case "$AVE_TEST_FFPROBE_MODE" in
   malformed) printf 'not-json\n'; exit ;;
   invalid-duration) printf '{"format":{"duration":"0"}}\n'; exit ;;
   malformed-duration) printf '{"format":{"duration":"unknown"}}\n'; exit ;;
-  missing-capture) printf '{"format":{"duration":"4.5","tags":{}}}\n'; exit ;;
+  missing-capture) printf '{"streams":[{"width":1920,"height":1080}],"format":{"duration":"6.0","tags":{}}}\n'; exit ;;
 esac
 for source do :; done
+case "$source" in
+  *corrupt*) echo "ffprobe: corrupt input" >&2; exit 1 ;;
+esac
 case "$source" in
   *earlier*) captured="2026-01-01T10:00:00Z" ;;
   *later*) captured="2026-01-01T11:00:00Z" ;;
   *) captured="2026-01-01T10:00:00Z" ;;
 esac
-printf '{"format":{"duration":"4.5","tags":{"creation_time":"%s"}}}\n' "$captured"
+case "$source" in
+  *portrait*) width=1080; height=1920 ;;
+  *) width=1920; height=1080 ;;
+esac
+case "$source" in
+  *hdr*) transfer="smpte2084" ;;
+  *) transfer="bt709" ;;
+esac
+printf '{"streams":[{"width":%s,"height":%s,"color_transfer":"%s"}],"format":{"duration":"6.0","tags":{"creation_time":"%s"}}}\n' "$width" "$height" "$transfer" "$captured"
 `)
 	writeExecutable(t, dir, "ffmpeg", `#!/bin/sh
 case "$*" in
   *"-encoders"*)
     if [ "$AVE_TEST_H264_ENCODER" = "videotoolbox" ]; then
+      echo "V....D h264_videotoolbox"
+    elif [ "$AVE_TEST_H264_ENCODER" = "both" ]; then
+      echo "V....D libx264"
       echo "V....D h264_videotoolbox"
     else
       echo "V....D libx264"
