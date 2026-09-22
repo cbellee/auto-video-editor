@@ -15,7 +15,7 @@ const (
 	exitSuccess = 0
 	exitFailure = 1
 	exitUsage   = 2
-	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force] [--fps <24|25|30|60>] [--aspect <landscape|portrait>] [--quality-profile <strict|balanced|lenient>] [--shake <reject|stabilize>]\n"
+	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force] [--fps <24|25|30|60>] [--aspect <landscape|portrait>] [--quality-profile <strict|balanced|lenient>] [--shake <reject|stabilize>] [--model <name>] [--guidance <text>] [--duration <seconds>]\n"
 	renderUsage = "usage: ave render <plan.json> [--media-root <dir>] [--force]\n"
 )
 
@@ -141,6 +141,28 @@ func parseEditOptions(args []string) (edit.Options, error) {
 				return edit.Options{}, fmt.Errorf("--shake requires reject or stabilize")
 			}
 			options.ShakeTreatment = args[index]
+		case "--model":
+			index++
+			if index >= len(args) || strings.HasPrefix(args[index], "-") {
+				return edit.Options{}, fmt.Errorf("--model requires a vision model name")
+			}
+			options.Model = args[index]
+		case "--guidance":
+			index++
+			if index >= len(args) {
+				return edit.Options{}, fmt.Errorf("--guidance requires text")
+			}
+			options.Guidance = args[index]
+		case "--duration":
+			index++
+			if index >= len(args) || strings.HasPrefix(args[index], "-") {
+				return edit.Options{}, fmt.Errorf("--duration requires a length in seconds")
+			}
+			seconds, convErr := strconv.ParseFloat(args[index], 64)
+			if convErr != nil || seconds <= 0 {
+				return edit.Options{}, fmt.Errorf("invalid --duration value %q; use a positive number of seconds", args[index])
+			}
+			options.Duration = seconds
 		default:
 			if strings.HasPrefix(args[index], "-") {
 				return edit.Options{}, fmt.Errorf("unknown edit option %q", args[index])

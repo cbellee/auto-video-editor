@@ -10,9 +10,42 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
+
+// TestMain starts a shared fake LM Studio server and a seeded config directory
+// so every edit test that inherits os.Environ() can rank footage without a live
+// model. Tests needing isolation (loopback rejection, model discovery) override
+// AVE_LM_STUDIO_URL/AVE_CONFIG_DIR via editEnv.
+func TestMain(m *testing.M) {
+	server := httptest.NewServer(lmStudioMux(true))
+	if err := os.Setenv("AVE_LM_STUDIO_URL", server.URL); err != nil {
+		panic(err)
+	}
+
+	configDir, err := os.MkdirTemp("", "ave-shared-config")
+	if err != nil {
+		panic(err)
+	}
+	if writeErr := os.WriteFile(
+		filepath.Join(configDir, "config.json"),
+		[]byte(`{"last_model":"local/vision-model"}`),
+		0o644,
+	); writeErr != nil {
+		panic(writeErr)
+	}
+	if err := os.Setenv("AVE_CONFIG_DIR", configDir); err != nil {
+		panic(err)
+	}
+
+	code := m.Run()
+
+	server.Close()
+	_ = os.RemoveAll(configDir)
+	os.Exit(code)
+}
 
 func TestEditCreatesChronologicalPlanAndFinishedVideo(t *testing.T) {
 	binary := buildCLI(t)
@@ -1681,9 +1714,19 @@ func runCLIWithEnv(t *testing.T, binary string, env []string, args ...string) (i
 
 func runCLIInDir(t *testing.T, binary, dir string, env []string, args ...string) (int, string) {
 	t.Helper()
+	return runCLIInDirStdin(t, binary, dir, env, nil, args...)
+}
+
+// runCLIInDirStdin runs the CLI with an explicit stdin. A non-nil stdin is a
+// pipe (not a character device), so the CLI treats the run as non-interactive.
+func runCLIInDirStdin(t *testing.T, binary, dir string, env []string, stdin *strings.Reader, args ...string) (int, string) {
+	t.Helper()
 
 	command := exec.Command(binary, args...)
 	command.Dir = dir
+	if stdin != nil {
+		command.Stdin = stdin
+	}
 	if coverageDir := os.Getenv("AVE_COVER_DIR"); coverageDir != "" {
 		env = append(env, "GOCOVERDIR="+coverageDir)
 	}
@@ -1751,6 +1794,15 @@ case "$*" in
     fi
     echo "A....D aac"
     exit
+    ;;
+esac
+# Contact-sheet extraction for AI ranking: a tiled grid to a .png sink. Emit
+# placeholder bytes without touching the render log so render assertions hold.
+case "$*" in
+  *tile=*)
+    for output do :; done
+    printf 'PNGDATA' > "$output"
+    exit 0
     ;;
 esac
 # Analysis metadata passes (scene detection + per-candidate metrics) write to a
@@ -1940,20 +1992,132 @@ func copyTestFile(t *testing.T, dst, src string) {
 func newFakeLMStudio(t *testing.T, withVisionModel bool) *httptest.Server {
 	t.Helper()
 
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.URL.Path != "/api/v1/models" {
-			http.NotFound(writer, request)
-			return
-		}
+	server := httptest.NewServer(lmStudioMux(withVisionModel))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// lmStudioMux builds a fake LM Studio API serving model discovery and chat
+// completions. Chat scores are deterministic, keyed on filename markers in the
+// candidate prompt so tests can assert selection and provenance.
+func lmStudioMux(withVisionModel bool) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/models", func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		models := `[]`
 		if withVisionModel {
 			models = `[{"type":"llm","key":"local/vision-model","capabilities":{"vision":true}}]`
 		}
-		if _, err := fmt.Fprintf(writer, `{"models":%s}`, models); err != nil {
-			t.Errorf("write model response: %v", err)
+		_, _ = fmt.Fprintf(writer, `{"models":%s}`, models)
+	})
+	mux.HandleFunc("/v1/chat/completions", handleFakeChat)
+	return mux
+}
+
+func handleFakeChat(writer http.ResponseWriter, request *http.Request) {
+	var payload struct {
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var systemText, userText string
+	repair := false
+	for _, message := range payload.Messages {
+		text := chatMessageText(message.Content)
+		switch message.Role {
+		case "system":
+			systemText += text
+		case "user":
+			userText += text
+			if strings.Contains(text, "was not valid") {
+				repair = true
+			}
 		}
-	}))
-	t.Cleanup(server.Close)
-	return server
+	}
+	content := fakeScoreContent(systemText, userText, repair)
+	writer.Header().Set("Content-Type", "application/json")
+	_, _ = fmt.Fprintf(writer, `{"choices":[{"message":{"content":%s}}]}`, strconv.Quote(content))
+}
+
+// chatMessageText extracts plain text from a chat message content field, which
+// is either a JSON string or an array of multimodal parts.
+func chatMessageText(raw json.RawMessage) string {
+	var asString string
+	if err := json.Unmarshal(raw, &asString); err == nil {
+		return asString
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return ""
+	}
+	var builder strings.Builder
+	for _, part := range parts {
+		if part.Type == "text" {
+			builder.WriteString(part.Text)
+		}
+	}
+	return builder.String()
+}
+
+// fakeScoreContent returns the assistant message body for one scoring turn.
+// Markers in the user prompt drive deterministic scores; "badscore" always
+// fails, "needsrepair" fails once then succeeds after the repair turn.
+func fakeScoreContent(systemText, userText string, repair bool) string {
+	if strings.Contains(userText, "badscore") {
+		return "not json at all"
+	}
+	if strings.Contains(userText, "needsrepair") && !repair {
+		return "sorry, here is prose with no json"
+	}
+
+	interest := 0.5
+	usefulness := 0.6
+	switch {
+	case strings.Contains(userText, "boring"):
+		interest = 0.1
+	case strings.Contains(userText, "hero"):
+		interest = 0.9
+	}
+	redundancy := 0.1
+	subjects := `["scene"]`
+	actions := `["motion"]`
+	if strings.Contains(userText, "dup") {
+		redundancy = 0.8
+		subjects = `["dog"]`
+		actions = `["run"]`
+	}
+
+	if token := guidanceToken(systemText); token != "" && strings.Contains(userText, token) {
+		interest = 0.99
+		usefulness = 0.95
+	}
+
+	return fmt.Sprintf(
+		`{"visual_interest":%.2f,"subjects":%s,"actions":%s,"energy":0.5,"usefulness":%.2f,"redundancy":%.2f}`,
+		interest, subjects, actions, usefulness, redundancy)
+}
+
+// guidanceToken extracts the marker after a "prefer:" directive in the system
+// prompt, letting tests prove Selection Guidance changes the ranking.
+func guidanceToken(systemText string) string {
+	index := strings.Index(systemText, "prefer:")
+	if index < 0 {
+		return ""
+	}
+	rest := systemText[index+len("prefer:"):]
+	rest = strings.TrimSpace(rest)
+	for offset, char := range rest {
+		if char == ' ' || char == '\n' || char == '.' {
+			return rest[:offset]
+		}
+	}
+	return rest
 }

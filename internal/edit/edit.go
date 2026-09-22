@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cbellee/auto-video-editor/internal/ffmpeg"
+	"github.com/cbellee/auto-video-editor/internal/lmstudio"
 )
 
 const planVersion = "1"
@@ -54,6 +55,14 @@ type Options struct {
 	QualityProfile string
 	// ShakeTreatment selects "reject" (default) or "stabilize" for shaky footage.
 	ShakeTreatment string
+	// Model names the LM Studio vision model to rank footage with. Empty uses
+	// the remembered last-successful model, or an interactive choice.
+	Model string
+	// Guidance is optional free-text Selection Guidance folded into the ranking
+	// prompt to bias selection among technically-eligible footage.
+	Guidance string
+	// Duration overrides the automatic target Finished Video length, in seconds.
+	Duration float64
 }
 
 // allowedFrameRates enumerates the output frame rates the MVP supports.
@@ -84,15 +93,59 @@ type Result struct {
 
 // Plan is the versioned baseline Edit Plan written by ave.
 type Plan struct {
-	Version          string            `json:"version"`
-	EditIntent       string            `json:"edit_intent"`
-	FinishedVideo    string            `json:"finished_video"`
-	FinishedVideoSHA string            `json:"finished_video_sha256,omitempty"`
-	Analysis         AnalysisSettings  `json:"analysis"`
-	SelectedSegments []SelectedSegment `json:"selected_segments"`
-	RejectedSegments []RejectedSegment `json:"rejected_segments,omitempty"`
-	Skipped          []SkippedClip     `json:"skipped,omitempty"`
-	Render           RenderSettings    `json:"render"`
+	Version           string             `json:"version"`
+	EditIntent        string             `json:"edit_intent"`
+	FinishedVideo     string             `json:"finished_video"`
+	FinishedVideoSHA  string             `json:"finished_video_sha256,omitempty"`
+	Analysis          AnalysisSettings   `json:"analysis"`
+	Ranking           *RankingSettings   `json:"ranking,omitempty"`
+	Audio             AudioSettings      `json:"audio"`
+	SelectedSegments  []SelectedSegment  `json:"selected_segments"`
+	RankedOutSegments []RankedOutSegment `json:"ranked_out_segments,omitempty"`
+	RejectedSegments  []RejectedSegment  `json:"rejected_segments,omitempty"`
+	Skipped           []SkippedClip      `json:"skipped,omitempty"`
+	Render            RenderSettings     `json:"render"`
+}
+
+// RankingSettings records the AI ranking provenance so a plan is reproducible
+// and auditable: which model scored the footage, from where, with what prompt
+// and guidance, and the duration budget that shaped selection.
+type RankingSettings struct {
+	Model          string  `json:"model"`
+	BaseURL        string  `json:"base_url"`
+	SystemPrompt   string  `json:"system_prompt"`
+	Guidance       string  `json:"guidance,omitempty"`
+	TargetSeconds  float64 `json:"target_seconds"`
+	SelectedSecond float64 `json:"selected_seconds"`
+	DurationSource string  `json:"duration_source"`
+}
+
+// AudioSettings records the Finished Video audio decision. The baseline
+// chronological edit keeps each segment's source audio.
+type AudioSettings struct {
+	Source string `json:"source"`
+}
+
+// SegmentScore is the AI assessment of a Candidate Segment, retained in the
+// plan as provenance.
+type SegmentScore struct {
+	VisualInterest float64  `json:"visual_interest"`
+	Energy         float64  `json:"energy"`
+	Usefulness     float64  `json:"usefulness"`
+	Redundancy     float64  `json:"redundancy"`
+	Subjects       []string `json:"subjects,omitempty"`
+	Actions        []string `json:"actions,omitempty"`
+	Base           float64  `json:"base_score"`
+}
+
+// RankedOutSegment records an eligible Candidate Segment the model ranked out
+// of the Finished Video for diversity or the duration budget.
+type RankedOutSegment struct {
+	SourcePath  string       `json:"source_path"`
+	StartSecond float64      `json:"start_seconds"`
+	EndSecond   float64      `json:"end_seconds"`
+	Score       SegmentScore `json:"score"`
+	Reason      string       `json:"reason"`
 }
 
 // SkippedClip records a Source Clip that was excluded and why.
@@ -111,6 +164,18 @@ type SelectedSegment struct {
 	Metrics            SegmentMetrics `json:"metrics"`
 	Shaky              bool           `json:"shaky,omitempty"`
 	NeedsStabilization bool           `json:"needs_stabilization,omitempty"`
+	// Transition into this segment; the baseline chronological edit hard-cuts.
+	Transition string `json:"transition"`
+	// SampleTimes are the source timestamps of the contact-sheet frames the
+	// model scored, retained for traceability.
+	SampleTimes []float64 `json:"sample_times,omitempty"`
+	// Score is the AI assessment that ranked this segment in.
+	Score *SegmentScore `json:"score,omitempty"`
+	// Prompt is the user prompt sent to the model for this segment.
+	Prompt string `json:"prompt,omitempty"`
+	// ScoreRepaired reports whether the model's first response needed one
+	// schema-guided repair before it validated.
+	ScoreRepaired bool `json:"score_repaired,omitempty"`
 }
 
 // RenderSettings describes the baseline Finished Video encoding.
@@ -269,10 +334,10 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	}
 
 	planDir := filepath.Dir(result.PlanPath)
-	var segments []SelectedSegment
+	var eligible []eligibleCandidate
 	var rejected []RejectedSegment
-	var renderInputs []renderInput
 	var eligibleDuration float64
+	order := 0
 	for _, clip := range clips {
 		fingerprint, fingerprintErr := sourceFingerprint(clip.path)
 		if fingerprintErr != nil {
@@ -296,22 +361,18 @@ func Run(ctx context.Context, options Options) (Result, error) {
 				})
 				continue
 			}
-			segments = append(segments, SelectedSegment{
-				SourcePath:         relPath,
-				SourceFingerprint:  fingerprint,
-				SourceIsHDR:        clip.isHDR,
-				StartSecond:        candidate.rng.start,
-				EndSecond:          candidate.rng.end,
-				Metrics:            candidate.metrics,
-				Shaky:              candidate.gate.shaky,
-				NeedsStabilization: candidate.gate.needsStabilization,
+			eligible = append(eligible, eligibleCandidate{
+				clipPath:           clip.path,
+				relPath:            relPath,
+				fingerprint:        fingerprint,
+				isHDR:              clip.isHDR,
+				rng:                candidate.rng,
+				metrics:            candidate.metrics,
+				shaky:              candidate.gate.shaky,
+				needsStabilization: candidate.gate.needsStabilization,
+				order:              order,
 			})
-			renderInputs = append(renderInputs, renderInput{
-				path:  clip.path,
-				start: candidate.rng.start,
-				end:   candidate.rng.end,
-				isHDR: clip.isHDR,
-			})
+			order++
 			eligibleDuration += duration
 		}
 	}
@@ -322,6 +383,68 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			eligibleDuration,
 			len(rejected),
 		)
+	}
+
+	client, err := lmstudio.FromEnv()
+	if err != nil {
+		return Result{}, err
+	}
+	model, err := resolveModel(ctx, client, options)
+	if err != nil {
+		return Result{}, err
+	}
+
+	rankingClient := &ranker{client: client, model: model, guidance: options.Guidance}
+	ranked, err := rankingClient.rankAll(ctx, eligible)
+	if err != nil {
+		return Result{}, err
+	}
+
+	durationSource := "automatic"
+	if options.Duration > 0 {
+		durationSource = "override"
+	}
+	targetSeconds := automaticDuration(eligibleDuration, options.Duration)
+	selected, droppedOut := selectChronological(ranked, targetSeconds)
+
+	segments := make([]SelectedSegment, 0, len(selected))
+	renderInputs := make([]renderInput, 0, len(selected))
+	var selectedDuration float64
+	for _, candidate := range selected {
+		score := scoreFrom(candidate)
+		segments = append(segments, SelectedSegment{
+			SourcePath:         candidate.relPath,
+			SourceFingerprint:  candidate.fingerprint,
+			SourceIsHDR:        candidate.isHDR,
+			StartSecond:        candidate.rng.start,
+			EndSecond:          candidate.rng.end,
+			Metrics:            candidate.metrics,
+			Shaky:              candidate.shaky,
+			NeedsStabilization: candidate.needsStabilization,
+			Transition:         transitionCut,
+			SampleTimes:        candidate.sampleTimes,
+			Score:              &score,
+			Prompt:             candidate.prompt,
+			ScoreRepaired:      candidate.repaired,
+		})
+		renderInputs = append(renderInputs, renderInput{
+			path:  candidate.clipPath,
+			start: candidate.rng.start,
+			end:   candidate.rng.end,
+			isHDR: candidate.isHDR,
+		})
+		selectedDuration += candidate.rng.end - candidate.rng.start
+	}
+
+	rankedOut := make([]RankedOutSegment, 0, len(droppedOut))
+	for _, candidate := range droppedOut {
+		rankedOut = append(rankedOut, RankedOutSegment{
+			SourcePath:  candidate.relPath,
+			StartSecond: candidate.rng.start,
+			EndSecond:   candidate.rng.end,
+			Score:       scoreFrom(candidate),
+			Reason:      "ranked out for diversity or duration budget",
+		})
 	}
 
 	renderSettings, err := renderSettingsFor(ctx, outputOrientation, options.FrameRate)
@@ -337,14 +460,29 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			ShakeTreatment: analysis.shake,
 			Thresholds:     analysis.thresholds,
 		},
-		SelectedSegments: segments,
-		RejectedSegments: rejected,
-		Skipped:          skipped,
-		Render:           renderSettings,
+		Ranking: &RankingSettings{
+			Model:          model,
+			BaseURL:        client.BaseURL(),
+			SystemPrompt:   systemPrompt(options.Guidance),
+			Guidance:       options.Guidance,
+			TargetSeconds:  targetSeconds,
+			SelectedSecond: selectedDuration,
+			DurationSource: durationSource,
+		},
+		Audio:             AudioSettings{Source: audioSource},
+		SelectedSegments:  segments,
+		RankedOutSegments: rankedOut,
+		RejectedSegments:  rejected,
+		Skipped:           skipped,
+		Render:            renderSettings,
+	}
+	if err := validatePlan(plan); err != nil {
+		return Result{}, err
 	}
 	if err := writePlan(result.PlanPath, plan, options.Force); err != nil {
 		return Result{}, err
 	}
+	rememberModel(model)
 
 	if options.PlanOnly {
 		result.VideoPath = ""
