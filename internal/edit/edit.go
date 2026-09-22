@@ -49,6 +49,11 @@ type Options struct {
 	// Stdin supplies interactive prompt answers; Prompt receives prompt text.
 	Stdin  io.Reader
 	Prompt io.Writer
+	// QualityProfile selects gate strictness ("strict"/"balanced"/"lenient");
+	// empty selects balanced.
+	QualityProfile string
+	// ShakeTreatment selects "reject" (default) or "stabilize" for shaky footage.
+	ShakeTreatment string
 }
 
 // allowedFrameRates enumerates the output frame rates the MVP supports.
@@ -83,7 +88,9 @@ type Plan struct {
 	EditIntent       string            `json:"edit_intent"`
 	FinishedVideo    string            `json:"finished_video"`
 	FinishedVideoSHA string            `json:"finished_video_sha256,omitempty"`
+	Analysis         AnalysisSettings  `json:"analysis"`
 	SelectedSegments []SelectedSegment `json:"selected_segments"`
+	RejectedSegments []RejectedSegment `json:"rejected_segments,omitempty"`
 	Skipped          []SkippedClip     `json:"skipped,omitempty"`
 	Render           RenderSettings    `json:"render"`
 }
@@ -96,11 +103,14 @@ type SkippedClip struct {
 
 // SelectedSegment identifies a source range included in an Edit Plan.
 type SelectedSegment struct {
-	SourcePath        string  `json:"source_path"`
-	SourceFingerprint string  `json:"source_fingerprint,omitempty"`
-	SourceIsHDR       bool    `json:"source_is_hdr,omitempty"`
-	StartSecond       float64 `json:"start_seconds"`
-	EndSecond         float64 `json:"end_seconds"`
+	SourcePath         string         `json:"source_path"`
+	SourceFingerprint  string         `json:"source_fingerprint,omitempty"`
+	SourceIsHDR        bool           `json:"source_is_hdr,omitempty"`
+	StartSecond        float64        `json:"start_seconds"`
+	EndSecond          float64        `json:"end_seconds"`
+	Metrics            SegmentMetrics `json:"metrics"`
+	Shaky              bool           `json:"shaky,omitempty"`
+	NeedsStabilization bool           `json:"needs_stabilization,omitempty"`
 }
 
 // RenderSettings describes the baseline Finished Video encoding.
@@ -253,20 +263,65 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		return Result{}, err
 	}
 
-	segments := make([]SelectedSegment, 0, len(clips))
+	analysis, err := resolveAnalysisConfig(options)
+	if err != nil {
+		return Result{}, err
+	}
+
 	planDir := filepath.Dir(result.PlanPath)
+	var segments []SelectedSegment
+	var rejected []RejectedSegment
+	var renderInputs []renderInput
+	var eligibleDuration float64
 	for _, clip := range clips {
 		fingerprint, fingerprintErr := sourceFingerprint(clip.path)
 		if fingerprintErr != nil {
 			return Result{}, fingerprintErr
 		}
-		segments = append(segments, SelectedSegment{
-			SourcePath:        planRelativePath(planDir, clip.path),
-			SourceFingerprint: fingerprint,
-			SourceIsHDR:       clip.isHDR,
-			StartSecond:       0,
-			EndSecond:         clip.duration,
-		})
+		candidates, analyzeErr := analyzeClip(ctx, clip.path, clip, analysis)
+		if analyzeErr != nil {
+			return Result{}, analyzeErr
+		}
+		relPath := planRelativePath(planDir, clip.path)
+		for _, candidate := range candidates {
+			duration := candidate.rng.end - candidate.rng.start
+			if !candidate.gate.eligible {
+				rejected = append(rejected, RejectedSegment{
+					SourcePath:  relPath,
+					StartSecond: candidate.rng.start,
+					EndSecond:   candidate.rng.end,
+					Metrics:     candidate.metrics,
+					Reasons:     candidate.gate.reasons,
+					HardFailure: candidate.gate.hardFailure,
+				})
+				continue
+			}
+			segments = append(segments, SelectedSegment{
+				SourcePath:         relPath,
+				SourceFingerprint:  fingerprint,
+				SourceIsHDR:        clip.isHDR,
+				StartSecond:        candidate.rng.start,
+				EndSecond:          candidate.rng.end,
+				Metrics:            candidate.metrics,
+				Shaky:              candidate.gate.shaky,
+				NeedsStabilization: candidate.gate.needsStabilization,
+			})
+			renderInputs = append(renderInputs, renderInput{
+				path:  clip.path,
+				start: candidate.rng.start,
+				end:   candidate.rng.end,
+				isHDR: clip.isHDR,
+			})
+			eligibleDuration += duration
+		}
+	}
+
+	if eligibleDuration < minUsableSeconds {
+		return Result{}, fmt.Errorf(
+			"less than five seconds of usable footage remains after quality gating (%.2fs eligible, %d candidate(s) rejected)",
+			eligibleDuration,
+			len(rejected),
+		)
 	}
 
 	renderSettings, err := renderSettingsFor(ctx, outputOrientation, options.FrameRate)
@@ -274,10 +329,16 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		return Result{}, err
 	}
 	plan := Plan{
-		Version:          planVersion,
-		EditIntent:       "chronological",
-		FinishedVideo:    result.VideoPath,
+		Version:       planVersion,
+		EditIntent:    "chronological",
+		FinishedVideo: result.VideoPath,
+		Analysis: AnalysisSettings{
+			QualityProfile: analysis.profile,
+			ShakeTreatment: analysis.shake,
+			Thresholds:     analysis.thresholds,
+		},
 		SelectedSegments: segments,
+		RejectedSegments: rejected,
 		Skipped:          skipped,
 		Render:           renderSettings,
 	}
@@ -289,7 +350,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		result.VideoPath = ""
 		return result, nil
 	}
-	if err := render(ctx, clips, result.VideoPath, renderSettings, options.Force); err != nil {
+	if err := render(ctx, renderInputs, result.VideoPath, renderSettings, options.Force); err != nil {
 		return Result{}, err
 	}
 	fingerprint, err := fileSHA256(result.VideoPath)
@@ -730,15 +791,11 @@ func renderSettingsFor(ctx context.Context, o orientation, frameRate int) (Rende
 
 func render(
 	ctx context.Context,
-	clips []sourceClip,
+	inputs []renderInput,
 	outputPath string,
 	settings RenderSettings,
 	force bool,
 ) error {
-	inputs := make([]renderInput, len(clips))
-	for index, clip := range clips {
-		inputs[index] = renderInput{path: clip.path, start: 0, end: clip.duration, isHDR: clip.isHDR}
-	}
 	args := encodeArgs(inputs, settings)
 	if force {
 		args = append(args, "-y")
@@ -770,11 +827,29 @@ type renderInput struct {
 // Rec.709.
 func encodeArgs(inputs []renderInput, settings RenderSettings) []string {
 	args := []string{"-hide_banner", "-loglevel", "error"}
+
+	// Dedupe Source Clips: opening the same file as several -i inputs can
+	// deadlock FFmpeg, so each unique clip is opened once and split into one
+	// branch per Candidate Segment that draws from it.
+	inputIndex := make(map[string]int)
+	var uniquePaths []string
+	segmentCount := make(map[string]int)
+	for _, input := range inputs {
+		if _, seen := inputIndex[input.path]; !seen {
+			inputIndex[input.path] = len(uniquePaths)
+			uniquePaths = append(uniquePaths, input.path)
+		}
+		segmentCount[input.path]++
+	}
+
 	var totalDuration float64
 	for _, input := range inputs {
-		args = append(args, "-i", input.path)
 		totalDuration += input.end - input.start
 	}
+	for _, path := range uniquePaths {
+		args = append(args, "-i", path)
+	}
+	audioInputIndex := len(uniquePaths)
 	args = append(
 		args,
 		"-f", "lavfi",
@@ -786,12 +861,34 @@ func encodeArgs(inputs []renderInput, settings RenderSettings) []string {
 	)
 
 	var filter strings.Builder
+
+	// Split each unique input into one labelled branch per Candidate Segment so
+	// that a decoded pad is never consumed more than once.
+	sourceBranches := make([][]string, len(uniquePaths))
+	for unique, path := range uniquePaths {
+		count := segmentCount[path]
+		fmt.Fprintf(&filter, "[%d:v:0]split=%d", unique, count)
+		branches := make([]string, count)
+		for branch := 0; branch < count; branch++ {
+			label := fmt.Sprintf("src%d_%d", unique, branch)
+			branches[branch] = label
+			fmt.Fprintf(&filter, "[%s]", label)
+		}
+		filter.WriteString(";")
+		sourceBranches[unique] = branches
+	}
+
+	nextBranch := make([]int, len(uniquePaths))
 	for index, input := range inputs {
+		unique := inputIndex[input.path]
+		sourceLabel := sourceBranches[unique][nextBranch[unique]]
+		nextBranch[unique]++
+
 		source := fmt.Sprintf("base%d", index)
 		fmt.Fprintf(
 			&filter,
-			"[%d:v:0]trim=start=%s:end=%s,setpts=PTS-STARTPTS",
-			index,
+			"[%s]trim=start=%s:end=%s,setpts=PTS-STARTPTS",
+			sourceLabel,
 			strconv.FormatFloat(input.start, 'f', 6, 64),
 			strconv.FormatFloat(input.end, 'f', 6, 64),
 		)
@@ -838,7 +935,7 @@ func encodeArgs(inputs []renderInput, settings RenderSettings) []string {
 	args = append(args,
 		"-filter_complex", filter.String(),
 		"-map", "[video]",
-		"-map", fmt.Sprintf("%d:a:0", len(inputs)),
+		"-map", fmt.Sprintf("%d:a:0", audioInputIndex),
 		"-t", strconv.FormatFloat(totalDuration, 'f', 6, 64),
 		"-map_metadata", "-1",
 		"-c:v", settings.VideoCodec,

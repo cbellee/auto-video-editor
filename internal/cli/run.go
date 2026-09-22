@@ -15,7 +15,7 @@ const (
 	exitSuccess = 0
 	exitFailure = 1
 	exitUsage   = 2
-	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force] [--fps <24|25|30|60>] [--aspect <landscape|portrait>]\n"
+	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force] [--fps <24|25|30|60>] [--aspect <landscape|portrait>] [--quality-profile <strict|balanced|lenient>] [--shake <reject|stabilize>]\n"
 	renderUsage = "usage: ave render <plan.json> [--media-root <dir>] [--force]\n"
 )
 
@@ -129,6 +129,18 @@ func parseEditOptions(args []string) (edit.Options, error) {
 				return edit.Options{}, fmt.Errorf("--aspect requires landscape or portrait")
 			}
 			options.Aspect = args[index]
+		case "--quality-profile":
+			index++
+			if index >= len(args) || strings.HasPrefix(args[index], "-") {
+				return edit.Options{}, fmt.Errorf("--quality-profile requires strict, balanced, or lenient")
+			}
+			options.QualityProfile = args[index]
+		case "--shake":
+			index++
+			if index >= len(args) || strings.HasPrefix(args[index], "-") {
+				return edit.Options{}, fmt.Errorf("--shake requires reject or stabilize")
+			}
+			options.ShakeTreatment = args[index]
 		default:
 			if strings.HasPrefix(args[index], "-") {
 				return edit.Options{}, fmt.Errorf("unknown edit option %q", args[index])

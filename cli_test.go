@@ -600,9 +600,40 @@ func decodeEditPlan(t *testing.T, planPath string) editPlanDocument {
 
 type editPlanDocument struct {
 	Segments []struct {
-		SourcePath string `json:"source_path"`
-		IsHDR      bool   `json:"source_is_hdr"`
+		SourcePath         string  `json:"source_path"`
+		IsHDR              bool    `json:"source_is_hdr"`
+		StartSecond        float64 `json:"start_seconds"`
+		EndSecond          float64 `json:"end_seconds"`
+		Shaky              bool    `json:"shaky"`
+		NeedsStabilization bool    `json:"needs_stabilization"`
+		Metrics            struct {
+			Blur    float64 `json:"blur"`
+			LumaAvg float64 `json:"luma_avg"`
+			Motion  float64 `json:"motion"`
+		} `json:"metrics"`
 	} `json:"selected_segments"`
+	Rejected []struct {
+		SourcePath  string   `json:"source_path"`
+		StartSecond float64  `json:"start_seconds"`
+		EndSecond   float64  `json:"end_seconds"`
+		Reasons     []string `json:"reasons"`
+		HardFailure bool     `json:"hard_failure"`
+		Metrics     struct {
+			Blur    float64 `json:"blur"`
+			LumaAvg float64 `json:"luma_avg"`
+			Motion  float64 `json:"motion"`
+		} `json:"metrics"`
+	} `json:"rejected_segments"`
+	Analysis struct {
+		QualityProfile string `json:"quality_profile"`
+		ShakeTreatment string `json:"shake_treatment"`
+		Thresholds     struct {
+			MaxBlur   float64 `json:"max_blur"`
+			MinLuma   float64 `json:"min_luma"`
+			MaxLuma   float64 `json:"max_luma"`
+			MaxMotion float64 `json:"max_motion"`
+		} `json:"thresholds"`
+	} `json:"analysis"`
 	Skipped []struct {
 		Path   string `json:"path"`
 		Reason string `json:"reason"`
@@ -664,6 +695,209 @@ func TestEditFailsWhenUsableFootageBelowFloor(t *testing.T) {
 	if !strings.Contains(output, "less than five seconds of usable footage") {
 		t.Errorf("output does not report the five second floor:\n%s", output)
 	}
+}
+
+func TestEditRecordsAnalysisSettingsAndDefaults(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "clip.mp4")
+	planPath := filepath.Join(workingDir, "source-edit.plan.json")
+	env := append(os.Environ(), "PATH="+createEditTools(t))
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+	plan := decodeEditPlan(t, planPath)
+	if plan.Analysis.QualityProfile != "balanced" {
+		t.Errorf("default quality profile = %q, want balanced", plan.Analysis.QualityProfile)
+	}
+	if plan.Analysis.ShakeTreatment != "reject" {
+		t.Errorf("default shake treatment = %q, want reject", plan.Analysis.ShakeTreatment)
+	}
+	if plan.Analysis.Thresholds.MaxBlur == 0 || plan.Analysis.Thresholds.MinLuma == 0 {
+		t.Errorf("thresholds not recorded in plan: %+v", plan.Analysis.Thresholds)
+	}
+	if len(plan.Segments) != 1 {
+		t.Fatalf("segments = %+v, want one eligible candidate", plan.Segments)
+	}
+	seg := plan.Segments[0]
+	if seg.Metrics.LumaAvg == 0 {
+		t.Errorf("segment metrics not retained: %+v", seg.Metrics)
+	}
+}
+
+func TestEditQualityProfileSelectsStrictThresholds(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "clip.mp4")
+	planPath := filepath.Join(workingDir, "source-edit.plan.json")
+	env := append(os.Environ(), "PATH="+createEditTools(t))
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only", "--quality-profile", "strict")
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+	plan := decodeEditPlan(t, planPath)
+	if plan.Analysis.QualityProfile != "strict" {
+		t.Errorf("quality profile = %q, want strict", plan.Analysis.QualityProfile)
+	}
+	if plan.Analysis.Thresholds.MaxBlur != 10 {
+		t.Errorf("strict MaxBlur = %v, want 10", plan.Analysis.Thresholds.MaxBlur)
+	}
+}
+
+func TestEditRejectsInvalidQualityProfile(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "clip.mp4")
+	env := append(os.Environ(), "PATH="+createEditTools(t))
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only", "--quality-profile", "nonsense")
+	if status != 1 {
+		t.Fatalf("status = %d, want 1\noutput:\n%s", status, output)
+	}
+	if !strings.Contains(output, "quality profile") {
+		t.Errorf("output does not explain invalid quality profile:\n%s", output)
+	}
+}
+
+func TestEditSubdividesLongShotIntoCandidates(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "long-action.mp4")
+	planPath := filepath.Join(workingDir, "source-edit.plan.json")
+	env := append(os.Environ(), "PATH="+createEditTools(t))
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+	plan := decodeEditPlan(t, planPath)
+	if len(plan.Segments) < 2 {
+		t.Fatalf("long shot produced %d candidates, want it subdivided into several", len(plan.Segments))
+	}
+	for _, seg := range plan.Segments {
+		length := seg.EndSecond - seg.StartSecond
+		if length < 1.0 {
+			t.Errorf("candidate %.2f-%.2f shorter than one second", seg.StartSecond, seg.EndSecond)
+		}
+		if length > 8.01 {
+			t.Errorf("candidate %.2f-%.2f longer than eight seconds", seg.StartSecond, seg.EndSecond)
+		}
+	}
+}
+
+func TestEditCollapsesLongStaticShotToRepresentative(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "long-static.mp4")
+	planPath := filepath.Join(workingDir, "source-edit.plan.json")
+	env := append(os.Environ(), "PATH="+createEditTools(t))
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+	plan := decodeEditPlan(t, planPath)
+	if len(plan.Segments) != 1 {
+		t.Fatalf("long static shot produced %d candidates, want a single representative", len(plan.Segments))
+	}
+}
+
+func TestEditSplitsSceneCutsIntoSeparateCandidates(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "twoshots.mp4")
+	planPath := filepath.Join(workingDir, "source-edit.plan.json")
+	env := append(os.Environ(), "PATH="+createEditTools(t))
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+	plan := decodeEditPlan(t, planPath)
+	if len(plan.Segments) != 2 {
+		t.Fatalf("scene cut produced %d candidates, want two shots", len(plan.Segments))
+	}
+}
+
+func TestEditRejectsHardFailuresWithReasons(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "good.mp4", "blurry-bad.mp4", "dark-bad.mp4")
+	planPath := filepath.Join(workingDir, "source-edit.plan.json")
+	env := append(os.Environ(), "PATH="+createEditTools(t))
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+	plan := decodeEditPlan(t, planPath)
+	if len(plan.Segments) != 1 || filepath.Base(plan.Segments[0].SourcePath) != "good.mp4" {
+		t.Fatalf("segments = %+v, want only good.mp4 eligible", plan.Segments)
+	}
+	rejectedBases := map[string][]string{}
+	for _, rej := range plan.Rejected {
+		if !rej.HardFailure {
+			t.Errorf("rejection %+v should be a hard failure", rej)
+		}
+		rejectedBases[filepath.Base(rej.SourcePath)] = rej.Reasons
+	}
+	if len(rejectedBases["blurry-bad.mp4"]) == 0 {
+		t.Errorf("blurry clip not rejected with reasons: %+v", plan.Rejected)
+	}
+	if len(rejectedBases["dark-bad.mp4"]) == 0 {
+		t.Errorf("dark clip not rejected with reasons: %+v", plan.Rejected)
+	}
+}
+
+func TestEditShakeRejectVersusStabilize(t *testing.T) {
+	binary := buildCLI(t)
+
+	t.Run("reject drops unstable footage", func(t *testing.T) {
+		workingDir, sourceDir := makeEditSource(t, "good.mp4", "shaky-clip.mp4")
+		planPath := filepath.Join(workingDir, "source-edit.plan.json")
+		env := append(os.Environ(), "PATH="+createEditTools(t))
+
+		status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only", "--shake", "reject")
+		if status != 0 {
+			t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+		}
+		plan := decodeEditPlan(t, planPath)
+		if len(plan.Segments) != 1 || filepath.Base(plan.Segments[0].SourcePath) != "good.mp4" {
+			t.Fatalf("segments = %+v, want shaky footage rejected", plan.Segments)
+		}
+		var found bool
+		for _, rej := range plan.Rejected {
+			if filepath.Base(rej.SourcePath) == "shaky-clip.mp4" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("shaky clip not recorded as rejected: %+v", plan.Rejected)
+		}
+	})
+
+	t.Run("stabilize retains flagged footage", func(t *testing.T) {
+		workingDir, sourceDir := makeEditSource(t, "good.mp4", "shaky-clip.mp4")
+		planPath := filepath.Join(workingDir, "source-edit.plan.json")
+		env := append(os.Environ(), "PATH="+createEditTools(t))
+
+		status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only", "--shake", "stabilize")
+		if status != 0 {
+			t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+		}
+		plan := decodeEditPlan(t, planPath)
+		if plan.Analysis.ShakeTreatment != "stabilize" {
+			t.Errorf("shake treatment = %q, want stabilize", plan.Analysis.ShakeTreatment)
+		}
+		var flagged bool
+		for _, seg := range plan.Segments {
+			if filepath.Base(seg.SourcePath) == "shaky-clip.mp4" {
+				if !seg.Shaky || !seg.NeedsStabilization {
+					t.Errorf("shaky segment not flagged for stabilization: %+v", seg)
+				}
+				flagged = true
+			}
+		}
+		if !flagged {
+			t.Errorf("shaky clip not retained under stabilize: %+v", plan.Segments)
+		}
+	})
 }
 
 func TestEditOrientationFollowsPortraitMajority(t *testing.T) {
@@ -1498,7 +1732,11 @@ case "$source" in
   *hdr*) transfer="smpte2084" ;;
   *) transfer="bt709" ;;
 esac
-printf '{"streams":[{"width":%s,"height":%s,"color_transfer":"%s"}],"format":{"duration":"6.0","tags":{"creation_time":"%s"}}}\n' "$width" "$height" "$transfer" "$captured"
+case "$source" in
+  *long*) duration="30.0" ;;
+  *) duration="6.0" ;;
+esac
+printf '{"streams":[{"width":%s,"height":%s,"color_transfer":"%s"}],"format":{"duration":"%s","tags":{"creation_time":"%s"}}}\n' "$width" "$height" "$transfer" "$duration" "$captured"
 `)
 	writeExecutable(t, dir, "ffmpeg", `#!/bin/sh
 case "$*" in
@@ -1515,6 +1753,93 @@ case "$*" in
     exit
     ;;
 esac
+# Analysis metadata passes (scene detection + per-candidate metrics) write to a
+# metadata=print sink and use the null muxer. Detect the sink path and source,
+# then emit deterministic detector output keyed on filename markers.
+metafile=""
+input=""
+prev=""
+for a in "$@"; do
+  case "$a" in
+    *metadata=print:file=*) metafile="${a##*metadata=print:file=}" ;;
+  esac
+  if [ "$prev" = "-i" ]; then input="$a"; fi
+  prev="$a"
+done
+if [ -n "$metafile" ]; then
+  case "$*" in
+    *scdet*)
+      case "$input" in
+        *static*) m="0.2" ;;
+        *shaky*) m="40.0" ;;
+        *) m="5.0" ;;
+      esac
+      {
+        printf 'frame:0 pts_time:0.0\n'
+        printf 'lavfi.scd.mafd=%s\n' "$m"
+        printf 'lavfi.scd.score=%s\n' "$m"
+        printf 'frame:1 pts_time:2.0\n'
+        printf 'lavfi.scd.mafd=%s\n' "$m"
+        printf 'lavfi.scd.score=%s\n' "$m"
+        printf 'frame:2 pts_time:4.0\n'
+        printf 'lavfi.scd.mafd=%s\n' "$m"
+        printf 'lavfi.scd.score=%s\n' "$m"
+        case "$input" in
+          *twoshots*)
+            printf 'frame:3 pts_time:3.0\n'
+            printf 'lavfi.scd.mafd=32.0\n'
+            printf 'lavfi.scd.score=32.0\n'
+            printf 'lavfi.scd.time=3.0\n'
+            ;;
+        esac
+        case "$input" in
+          *long*)
+            printf 'frame:4 pts_time:10.0\n'
+            printf 'lavfi.scd.mafd=%s\n' "$m"
+            printf 'frame:5 pts_time:20.0\n'
+            printf 'lavfi.scd.mafd=%s\n' "$m"
+            printf 'frame:6 pts_time:28.0\n'
+            printf 'lavfi.scd.mafd=%s\n' "$m"
+            ;;
+        esac
+      } > "$metafile"
+      exit 0
+      ;;
+    *blurdetect*)
+      case "$input" in
+        *blurry*) blur="30.0" ;;
+        *) blur="5.0" ;;
+      esac
+      case "$input" in
+        *dark*) yavg="10.0" ;;
+        *bright*) yavg="250.0" ;;
+        *) yavg="120.0" ;;
+      esac
+      {
+        printf 'frame:0 pts_time:0.0\n'
+        printf 'lavfi.blur=%s\n' "$blur"
+        printf 'lavfi.signalstats.YAVG=%s\n' "$yavg"
+        printf 'lavfi.signalstats.YMIN=6.0\n'
+        printf 'lavfi.signalstats.YMAX=240.0\n'
+      } > "$metafile"
+      exit 0
+      ;;
+    *ametadata*)
+      case "$input" in
+        *silent*) : ;;
+        *)
+          {
+            printf 'frame:0 pts_time:0.0\n'
+            printf 'lavfi.astats.1.RMS_level=-20.0\n'
+            printf 'lavfi.astats.1.Peak_level=-10.0\n'
+          } > "$metafile"
+          ;;
+      esac
+      exit 0
+      ;;
+  esac
+  exit 0
+fi
 printf '%s\n' "$*" > "$AVE_TEST_FFMPEG_LOG"
 for output do :; done
 if [ -n "$AVE_TEST_FFMPEG_FAIL" ]; then
