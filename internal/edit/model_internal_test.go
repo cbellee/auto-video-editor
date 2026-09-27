@@ -93,3 +93,47 @@ func TestRememberModelRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestResolveIntentDefaultsChronological(t *testing.T) {
+	intent, err := resolveIntent(Options{})
+	if err != nil {
+		t.Fatalf("resolveIntent: %v", err)
+	}
+	if intent != intentChronological {
+		t.Errorf("intent = %q, want chronological", intent)
+	}
+}
+
+func TestResolveIntentFlagWins(t *testing.T) {
+	intent, err := resolveIntent(Options{Intent: "Thematic"})
+	if err != nil {
+		t.Fatalf("resolveIntent: %v", err)
+	}
+	if intent != intentThematic {
+		t.Errorf("intent = %q, want thematic", intent)
+	}
+}
+
+func TestResolveIntentRejectsUnknown(t *testing.T) {
+	if _, err := resolveIntent(Options{Intent: "documentary"}); err == nil {
+		t.Fatal("expected error for unknown intent")
+	}
+}
+
+func TestResolveIntentPromptsInteractively(t *testing.T) {
+	var prompt strings.Builder
+	intent, err := resolveIntent(Options{
+		Interactive: true,
+		Stdin:       strings.NewReader("thematic\n"),
+		Prompt:      &prompt,
+	})
+	if err != nil {
+		t.Fatalf("resolveIntent: %v", err)
+	}
+	if intent != intentThematic {
+		t.Errorf("intent = %q, want thematic", intent)
+	}
+	if !strings.Contains(prompt.String(), "intent") {
+		t.Errorf("expected an intent prompt, got %q", prompt.String())
+	}
+}

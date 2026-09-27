@@ -127,12 +127,56 @@ func TestSampleTimestampsMatchesFPSFilterSlices(t *testing.T) {
 }
 
 func TestSystemPromptFoldsGuidance(t *testing.T) {
-	base := systemPrompt("")
-	guided := systemPrompt("prefer dogs")
+	base := systemPrompt(intentChronological, "", "")
+	guided := systemPrompt(intentChronological, "prefer dogs", "")
 	if strings.Contains(base, "prefer dogs") {
 		t.Error("base prompt should not contain guidance")
 	}
 	if !strings.Contains(guided, "prefer dogs") {
 		t.Error("guided prompt should contain the guidance text")
+	}
+}
+
+func TestSystemPromptReflectsThematicIntentAndTheme(t *testing.T) {
+	chrono := systemPrompt(intentChronological, "", "")
+	if strings.Contains(chrono, "montage") {
+		t.Error("chronological prompt should not describe a montage")
+	}
+	thematic := systemPrompt(intentThematic, "", "surfing adventure")
+	if !strings.Contains(thematic, "montage") {
+		t.Error("thematic prompt should describe a montage")
+	}
+	if !strings.Contains(thematic, "surfing adventure") {
+		t.Error("thematic prompt should fold in the theme")
+	}
+}
+
+func TestOrderThematicBuildsEnergyArc(t *testing.T) {
+	segments := []rankedCandidate{
+		{eligibleCandidate: eligibleCandidate{order: 0}, base: 0.5, score: lmstudio.Score{Energy: 0.9}},
+		{eligibleCandidate: eligibleCandidate{order: 1}, base: 0.5, score: lmstudio.Score{Energy: 0.2}},
+		{eligibleCandidate: eligibleCandidate{order: 2}, base: 0.5, score: lmstudio.Score{Energy: 0.6}},
+	}
+	ordered := orderThematic(segments)
+	if len(ordered) != 3 {
+		t.Fatalf("expected 3 segments, got %d", len(ordered))
+	}
+	if ordered[0].score.Energy != 0.2 {
+		t.Errorf("expected lowest-energy establishing shot first, got %v", ordered[0].score.Energy)
+	}
+	if ordered[len(ordered)-1].score.Energy != 0.9 {
+		t.Errorf("expected highest-energy conclusive shot last, got %v", ordered[len(ordered)-1].score.Energy)
+	}
+}
+
+func TestAggregateTermsOrdersByFrequency(t *testing.T) {
+	ranked := []rankedCandidate{
+		{score: lmstudio.Score{Subjects: []string{"dog", "beach"}}},
+		{score: lmstudio.Score{Subjects: []string{"dog", "surf"}}},
+		{score: lmstudio.Score{Subjects: []string{"dog"}}},
+	}
+	terms := aggregateTerms(ranked, func(c rankedCandidate) []string { return c.score.Subjects })
+	if len(terms) == 0 || terms[0] != "dog" {
+		t.Errorf("expected most frequent subject first, got %v", terms)
 	}
 }

@@ -8,12 +8,18 @@ import (
 
 const transitionCut = "cut"
 
+// Edit Intent values ave can produce.
+const (
+	intentChronological = "chronological"
+	intentThematic      = "thematic"
+)
+
 // approvedTransitions enumerates the transitions the baseline chronological
 // edit may use. Model-selected transitions arrive in a later ticket.
 var approvedTransitions = map[string]bool{transitionCut: true}
 
 // knownEditIntents enumerates the Edit Intents ave can produce today.
-var knownEditIntents = map[string]bool{"chronological": true}
+var knownEditIntents = map[string]bool{intentChronological: true, intentThematic: true}
 
 // audioSource is the baseline audio decision: keep each segment's source audio.
 const audioSource = "source"

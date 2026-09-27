@@ -68,7 +68,9 @@ type rankedCandidate struct {
 type ranker struct {
 	client   scorer
 	model    string
+	intent   string
 	guidance string
+	theme    string
 }
 
 // rankAll extracts a contact sheet for each candidate, scores it, and returns
@@ -81,10 +83,10 @@ func (r *ranker) rankAll(ctx context.Context, candidates []eligibleCandidate) ([
 		if err != nil {
 			return nil, err
 		}
-		prompt := candidatePrompt(candidate, times, r.guidance)
+		prompt := candidatePrompt(candidate, times, r.guidance, r.theme)
 		result, err := r.client.Score(ctx, lmstudio.ScoreRequest{
 			Model:        r.model,
-			SystemPrompt: systemPrompt(r.guidance),
+			SystemPrompt: systemPrompt(r.intent, r.guidance, r.theme),
 			UserPrompt:   prompt,
 			ImagePNG:     sheet,
 		})
@@ -227,16 +229,28 @@ func sampleTimestamps(rng candidateRange, count int) []float64 {
 }
 
 // systemPrompt instructs the model to score a single Candidate Segment and to
-// respect but never override technical selection.
-func systemPrompt(guidance string) string {
+// respect but never override technical selection. The intent and optional theme
+// and guidance shape what footage the model should prefer.
+func systemPrompt(intent, guidance, theme string) string {
 	var builder strings.Builder
+	context := "a chronological highlight edit"
+	if intent == intentThematic {
+		context = "a thematic highlight montage organized around a theme"
+	}
 	builder.WriteString(
-		"You assess a single video Candidate Segment for a chronological highlight edit. " +
+		"You assess a single video Candidate Segment for " + context + ". " +
 			"You are shown a contact sheet of timestamped frames sampled from the segment. " +
 			"Rate visual_interest, energy, usefulness, and redundancy from 0 to 1, and list the " +
 			"main subjects and actions. Higher redundancy means the shot looks generic or repetitive. " +
 			"Judge only what is visible; do not try to rescue footage that was already rejected for " +
 			"technical quality. Respond with only the JSON object.")
+	if strings.TrimSpace(theme) != "" {
+		builder.WriteString("\nThe montage theme is: ")
+		builder.WriteString(strings.TrimSpace(theme))
+		builder.WriteString(
+			"\nRaise usefulness and visual_interest for footage that expresses this theme, but never " +
+				"rescue technically rejected footage.")
+	}
 	if strings.TrimSpace(guidance) != "" {
 		builder.WriteString("\nSelection guidance from the user: ")
 		builder.WriteString(strings.TrimSpace(guidance))
@@ -248,7 +262,7 @@ func systemPrompt(guidance string) string {
 
 // candidatePrompt describes one candidate, naming the source and the exact
 // source timestamps of each contact-sheet tile so decisions stay traceable.
-func candidatePrompt(candidate eligibleCandidate, times []float64, guidance string) string {
+func candidatePrompt(candidate eligibleCandidate, times []float64, guidance, theme string) string {
 	labels := make([]string, len(times))
 	for index, time := range times {
 		labels[index] = fmt.Sprintf("%.2fs", time)
@@ -257,10 +271,95 @@ func candidatePrompt(candidate eligibleCandidate, times []float64, guidance stri
 		"Source clip: %s\nSegment: %.2fs to %.2fs.\nContact sheet tiles (left to right, top to bottom) "+
 			"were sampled at source times %s.\nScore this segment.",
 		candidate.relPath, candidate.rng.start, candidate.rng.end, strings.Join(labels, ", "))
+	if strings.TrimSpace(theme) != "" {
+		prompt += "\nRemember the montage theme when scoring."
+	}
 	if strings.TrimSpace(guidance) != "" {
 		prompt += "\nRemember the user's selection guidance when scoring."
 	}
 	return prompt
+}
+
+// orderThematic arranges the selected segments into an establishing opening,
+// rising visual energy, and a conclusive high-energy ending by sorting on the
+// model's energy score ascending, breaking ties toward stronger footage and
+// then capture order.
+func orderThematic(selected []rankedCandidate) []rankedCandidate {
+	ordered := make([]rankedCandidate, len(selected))
+	copy(ordered, selected)
+	sort.SliceStable(ordered, func(left, right int) bool {
+		if ordered[left].score.Energy != ordered[right].score.Energy {
+			return ordered[left].score.Energy < ordered[right].score.Energy
+		}
+		if ordered[left].base != ordered[right].base {
+			return ordered[left].base > ordered[right].base
+		}
+		return ordered[left].order < ordered[right].order
+	})
+	return ordered
+}
+
+// themeDiscoverer discovers a recurring theme from aggregated assessments.
+type themeDiscoverer interface {
+	DiscoverTheme(ctx context.Context, req lmstudio.ThemeRequest) (lmstudio.ThemeResult, error)
+}
+
+// discoverTheme asks the model to name the strongest recurring theme across the
+// ranked candidates' subjects and actions.
+func discoverTheme(ctx context.Context, discoverer themeDiscoverer, model, guidance string, ranked []rankedCandidate) (lmstudio.ThemeResult, error) {
+	return discoverer.DiscoverTheme(ctx, lmstudio.ThemeRequest{
+		Model:        model,
+		SystemPrompt: themeSystemPrompt(guidance),
+		UserPrompt:   themeUserPrompt(ranked),
+	})
+}
+
+// themeSystemPrompt instructs the model to name a single recurring theme.
+func themeSystemPrompt(guidance string) string {
+	prompt := "You are given the subjects and actions observed across a set of video segments. " +
+		"Identify the single strongest recurring theme that ties them together, as a short phrase. " +
+		"Respond with only a JSON object of the form {\"theme\":\"...\"}."
+	if strings.TrimSpace(guidance) != "" {
+		prompt += "\nFavor a theme consistent with this user guidance: " + strings.TrimSpace(guidance)
+	}
+	return prompt
+}
+
+// themeUserPrompt lists the observed subjects and actions by descending
+// frequency for theme discovery.
+func themeUserPrompt(ranked []rankedCandidate) string {
+	subjects := aggregateTerms(ranked, func(c rankedCandidate) []string { return c.score.Subjects })
+	actions := aggregateTerms(ranked, func(c rankedCandidate) []string { return c.score.Actions })
+	return fmt.Sprintf("Subjects (most frequent first): %s\nActions (most frequent first): %s\nName the recurring theme.",
+		strings.Join(subjects, ", "), strings.Join(actions, ", "))
+}
+
+// aggregateTerms returns distinct terms ordered by descending frequency, then
+// alphabetically, so the theme prompt is deterministic.
+func aggregateTerms(ranked []rankedCandidate, extract func(rankedCandidate) []string) []string {
+	counts := make(map[string]int)
+	for _, candidate := range ranked {
+		seen := make(map[string]bool)
+		for _, term := range extract(candidate) {
+			normalized := strings.ToLower(strings.TrimSpace(term))
+			if normalized == "" || seen[normalized] {
+				continue
+			}
+			seen[normalized] = true
+			counts[normalized]++
+		}
+	}
+	terms := make([]string, 0, len(counts))
+	for term := range counts {
+		terms = append(terms, term)
+	}
+	sort.SliceStable(terms, func(left, right int) bool {
+		if counts[terms[left]] != counts[terms[right]] {
+			return counts[terms[left]] > counts[terms[right]]
+		}
+		return terms[left] < terms[right]
+	})
+	return terms
 }
 
 // contactSheet extracts a tiled grid of frames from a candidate window as PNG

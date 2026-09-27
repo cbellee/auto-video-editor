@@ -163,3 +163,68 @@ func chatEnvelope(content string) string {
 	})
 	return string(body)
 }
+
+func TestDiscoverThemeParsesValidResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, chatEnvelope(`{"theme":"a day at the beach"}`))
+	}))
+	defer server.Close()
+
+	client, _ := New(server.URL)
+	result, err := client.DiscoverTheme(context.Background(), ThemeRequest{Model: "m", UserPrompt: "subjects: beach"})
+	if err != nil {
+		t.Fatalf("DiscoverTheme: %v", err)
+	}
+	if result.Repaired {
+		t.Error("valid response should not be marked repaired")
+	}
+	if result.Theme != "a day at the beach" {
+		t.Fatalf("unexpected theme %q", result.Theme)
+	}
+}
+
+func TestDiscoverThemeRepairsOnceThenSucceeds(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			_, _ = io.WriteString(w, chatEnvelope("prose without json"))
+			return
+		}
+		_, _ = io.WriteString(w, chatEnvelope(`{"theme":"surfing"}`))
+	}))
+	defer server.Close()
+
+	client, _ := New(server.URL)
+	result, err := client.DiscoverTheme(context.Background(), ThemeRequest{Model: "m"})
+	if err != nil {
+		t.Fatalf("DiscoverTheme with one repair: %v", err)
+	}
+	if !result.Repaired || result.Theme != "surfing" {
+		t.Fatalf("unexpected result %+v", result)
+	}
+	if calls != 2 {
+		t.Errorf("expected exactly 2 calls (initial + one repair), got %d", calls)
+	}
+}
+
+func TestDiscoverThemeFailsAfterRepairAttempt(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = io.WriteString(w, chatEnvelope(`{"theme":""}`))
+	}))
+	defer server.Close()
+
+	client, _ := New(server.URL)
+	_, err := client.DiscoverTheme(context.Background(), ThemeRequest{Model: "m"})
+	if err == nil {
+		t.Fatal("expected failure when theme never validates")
+	}
+	if calls != 2 {
+		t.Errorf("expected exactly 2 calls (initial + one repair), got %d", calls)
+	}
+	if !strings.Contains(err.Error(), "repair") {
+		t.Errorf("error should mention the repair attempt: %v", err)
+	}
+}
