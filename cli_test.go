@@ -2040,8 +2040,24 @@ func handleFakeChat(writer http.ResponseWriter, request *http.Request) {
 		}
 	}
 	content := fakeScoreContent(systemText, userText, repair)
+	if strings.Contains(systemText, "recurring theme") {
+		content = fakeThemeContent(userText, repair)
+	}
 	writer.Header().Set("Content-Type", "application/json")
 	_, _ = fmt.Fprintf(writer, `{"choices":[{"message":{"content":%s}}]}`, strconv.Quote(content))
+}
+
+// fakeThemeContent returns a discovered-theme JSON body. "needsrepair" in the
+// aggregated terms fails once then succeeds, mirroring the score repair path.
+func fakeThemeContent(userText string, repair bool) string {
+	if strings.Contains(userText, "needsrepair") && !repair {
+		return "here is prose with no json object"
+	}
+	theme := "an adventure"
+	if strings.Contains(userText, "dog") {
+		theme = "a dog at play"
+	}
+	return fmt.Sprintf(`{"theme":%q}`, theme)
 }
 
 // chatMessageText extracts plain text from a chat message content field, which
@@ -2086,6 +2102,13 @@ func fakeScoreContent(systemText, userText string, repair bool) string {
 	case strings.Contains(userText, "hero"):
 		interest = 0.9
 	}
+	energy := 0.5
+	switch {
+	case strings.Contains(userText, "calm"):
+		energy = 0.2
+	case strings.Contains(userText, "peak"):
+		energy = 0.9
+	}
 	redundancy := 0.1
 	subjects := `["scene"]`
 	actions := `["motion"]`
@@ -2101,8 +2124,8 @@ func fakeScoreContent(systemText, userText string, repair bool) string {
 	}
 
 	return fmt.Sprintf(
-		`{"visual_interest":%.2f,"subjects":%s,"actions":%s,"energy":0.5,"usefulness":%.2f,"redundancy":%.2f}`,
-		interest, subjects, actions, usefulness, redundancy)
+		`{"visual_interest":%.2f,"subjects":%s,"actions":%s,"energy":%.2f,"usefulness":%.2f,"redundancy":%.2f}`,
+		interest, subjects, actions, energy, usefulness, redundancy)
 }
 
 // guidanceToken extracts the marker after a "prefer:" directive in the system

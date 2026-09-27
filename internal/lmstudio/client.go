@@ -174,7 +174,7 @@ func (c *Client) Score(ctx context.Context, req ScoreRequest) (ScoreResult, erro
 		{Role: "user", Content: userContent(req.UserPrompt, req.ImagePNG)},
 	}
 
-	raw, err := c.chat(ctx, req.Model, messages)
+	raw, err := c.chat(ctx, req.Model, messages, scoreResponseFormat())
 	if err != nil {
 		return ScoreResult{}, err
 	}
@@ -188,7 +188,7 @@ func (c *Client) Score(ctx context.Context, req ScoreRequest) (ScoreResult, erro
 		chatMessage{Role: "assistant", Content: raw},
 		chatMessage{Role: "user", Content: repairInstruction(parseErr)},
 	)
-	repaired, err := c.chat(ctx, req.Model, messages)
+	repaired, err := c.chat(ctx, req.Model, messages, scoreResponseFormat())
 	if err != nil {
 		return ScoreResult{}, err
 	}
@@ -197,6 +197,98 @@ func (c *Client) Score(ctx context.Context, req ScoreRequest) (ScoreResult, erro
 		return ScoreResult{}, fmt.Errorf("model returned an invalid score after one repair attempt: %w", parseErr)
 	}
 	return ScoreResult{Score: score, RawResponse: repaired, Repaired: true}, nil
+}
+
+// ThemeRequest carries the inputs for discovering a recurring theme from the
+// aggregated per-segment assessments.
+type ThemeRequest struct {
+	Model        string
+	SystemPrompt string
+	UserPrompt   string
+}
+
+// ThemeResult pairs the discovered theme with the raw response retained as
+// provenance and whether a repair was needed.
+type ThemeResult struct {
+	Theme       string
+	RawResponse string
+	Repaired    bool
+}
+
+// DiscoverTheme asks the model for a short recurring theme phrase. Like Score,
+// it makes exactly one schema-guided repair attempt, then fails without a
+// guessed fallback.
+func (c *Client) DiscoverTheme(ctx context.Context, req ThemeRequest) (ThemeResult, error) {
+	messages := []chatMessage{
+		{Role: "system", Content: req.SystemPrompt},
+		{Role: "user", Content: req.UserPrompt},
+	}
+
+	raw, err := c.chat(ctx, req.Model, messages, themeResponseFormat())
+	if err != nil {
+		return ThemeResult{}, err
+	}
+	theme, parseErr := parseTheme(raw)
+	if parseErr == nil {
+		return ThemeResult{Theme: theme, RawResponse: raw}, nil
+	}
+
+	messages = append(messages,
+		chatMessage{Role: "assistant", Content: raw},
+		chatMessage{Role: "user", Content: themeRepairInstruction(parseErr)},
+	)
+	repaired, err := c.chat(ctx, req.Model, messages, themeResponseFormat())
+	if err != nil {
+		return ThemeResult{}, err
+	}
+	theme, parseErr = parseTheme(repaired)
+	if parseErr != nil {
+		return ThemeResult{}, fmt.Errorf("model returned an invalid theme after one repair attempt: %w", parseErr)
+	}
+	return ThemeResult{Theme: theme, RawResponse: repaired, Repaired: true}, nil
+}
+
+func themeRepairInstruction(cause error) string {
+	return fmt.Sprintf(
+		"That response was not valid: %s. Reply with only a JSON object matching the schema "+
+			"{\"theme\":string} where theme is a short phrase. Do not include any other text.",
+		cause,
+	)
+}
+
+// parseTheme extracts a non-empty theme phrase from a possibly fenced JSON
+// object.
+func parseTheme(raw string) (string, error) {
+	trimmed := extractJSON(raw)
+	if trimmed == "" {
+		return "", fmt.Errorf("response contained no JSON object")
+	}
+	var payload struct {
+		Theme string `json:"theme"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &payload); err != nil {
+		return "", fmt.Errorf("parse theme JSON: %w", err)
+	}
+	if strings.TrimSpace(payload.Theme) == "" {
+		return "", fmt.Errorf("theme was empty")
+	}
+	return strings.TrimSpace(payload.Theme), nil
+}
+
+// themeResponseFormat asks LM Studio for a structured theme object.
+func themeResponseFormat() map[string]any {
+	return map[string]any{
+		"type": "json_schema",
+		"json_schema": map[string]any{
+			"name":   "recurring_theme",
+			"strict": true,
+			"schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"theme": map[string]any{"type": "string"}},
+				"required":   []string{"theme"},
+			},
+		},
+	}
 }
 
 // userContent assembles the multimodal user turn: the prompt text followed by
@@ -224,12 +316,12 @@ func repairInstruction(cause error) string {
 }
 
 // chat posts a chat completion and returns the assistant message content.
-func (c *Client) chat(ctx context.Context, model string, messages []chatMessage) (string, error) {
+func (c *Client) chat(ctx context.Context, model string, messages []chatMessage, responseFormat map[string]any) (string, error) {
 	body, err := json.Marshal(map[string]any{
 		"model":           model,
 		"messages":        messages,
 		"temperature":     0,
-		"response_format": scoreResponseFormat(),
+		"response_format": responseFormat,
 	})
 	if err != nil {
 		return "", fmt.Errorf("encode chat request: %w", err)

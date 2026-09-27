@@ -63,6 +63,12 @@ type Options struct {
 	Guidance string
 	// Duration overrides the automatic target Finished Video length, in seconds.
 	Duration float64
+	// Intent selects the Edit Intent ("chronological" or "thematic"); empty
+	// selects chronological, or prompts when interactive.
+	Intent string
+	// Theme optionally guides a thematic edit; when empty under thematic intent
+	// the model discovers a recurring theme.
+	Theme string
 }
 
 // allowedFrameRates enumerates the output frame rates the MVP supports.
@@ -113,6 +119,9 @@ type Plan struct {
 type RankingSettings struct {
 	Model          string  `json:"model"`
 	BaseURL        string  `json:"base_url"`
+	Intent         string  `json:"intent"`
+	Theme          string  `json:"theme,omitempty"`
+	ThemeSource    string  `json:"theme_source,omitempty"`
 	SystemPrompt   string  `json:"system_prompt"`
 	Guidance       string  `json:"guidance,omitempty"`
 	TargetSeconds  float64 `json:"target_seconds"`
@@ -393,8 +402,14 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	intent, err := resolveIntent(options)
+	if err != nil {
+		return Result{}, err
+	}
+	theme := strings.TrimSpace(options.Theme)
+	rankingTheme := theme
 
-	rankingClient := &ranker{client: client, model: model, guidance: options.Guidance}
+	rankingClient := &ranker{client: client, model: model, intent: intent, guidance: options.Guidance, theme: theme}
 	ranked, err := rankingClient.rankAll(ctx, eligible)
 	if err != nil {
 		return Result{}, err
@@ -406,6 +421,21 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	}
 	targetSeconds := automaticDuration(eligibleDuration, options.Duration)
 	selected, droppedOut := selectChronological(ranked, targetSeconds)
+
+	themeSource := ""
+	if intent == intentThematic {
+		if theme != "" {
+			themeSource = "user"
+		} else {
+			discovered, discoverErr := discoverTheme(ctx, client, model, options.Guidance, ranked)
+			if discoverErr != nil {
+				return Result{}, discoverErr
+			}
+			theme = discovered.Theme
+			themeSource = "discovered"
+		}
+		selected = orderThematic(selected)
+	}
 
 	segments := make([]SelectedSegment, 0, len(selected))
 	renderInputs := make([]renderInput, 0, len(selected))
@@ -453,7 +483,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	}
 	plan := Plan{
 		Version:       planVersion,
-		EditIntent:    "chronological",
+		EditIntent:    intent,
 		FinishedVideo: result.VideoPath,
 		Analysis: AnalysisSettings{
 			QualityProfile: analysis.profile,
@@ -463,7 +493,10 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		Ranking: &RankingSettings{
 			Model:          model,
 			BaseURL:        client.BaseURL(),
-			SystemPrompt:   systemPrompt(options.Guidance),
+			Intent:         intent,
+			Theme:          theme,
+			ThemeSource:    themeSource,
+			SystemPrompt:   systemPrompt(intent, options.Guidance, rankingTheme),
 			Guidance:       options.Guidance,
 			TargetSeconds:  targetSeconds,
 			SelectedSecond: selectedDuration,

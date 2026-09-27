@@ -11,6 +11,44 @@ import (
 	"github.com/cbellee/auto-video-editor/internal/lmstudio"
 )
 
+// resolveIntent decides the Edit Intent. An explicit --intent flag wins;
+// otherwise chronological is the default, except an interactive run prompts the
+// user to choose so the creative decision is deliberate.
+func resolveIntent(options Options) (string, error) {
+	switch strings.TrimSpace(strings.ToLower(options.Intent)) {
+	case intentChronological:
+		return intentChronological, nil
+	case intentThematic:
+		return intentThematic, nil
+	case "":
+		// fall through to default or prompt
+	default:
+		return "", fmt.Errorf("invalid intent %q; use chronological or thematic", options.Intent)
+	}
+	if !options.Interactive || options.Prompt == nil || options.Stdin == nil {
+		return intentChronological, nil
+	}
+	return promptForIntent(options)
+}
+
+// promptForIntent asks the user to choose an Edit Intent interactively.
+func promptForIntent(options Options) (string, error) {
+	reader := bufio.NewReader(options.Stdin)
+	for {
+		_, _ = fmt.Fprint(options.Prompt, "Choose an edit intent [chronological/thematic] (default chronological): ")
+		line, readErr := reader.ReadString('\n')
+		switch strings.TrimSpace(strings.ToLower(line)) {
+		case "", "chronological", "c":
+			return intentChronological, nil
+		case "thematic", "t":
+			return intentThematic, nil
+		}
+		if readErr != nil {
+			return intentChronological, nil
+		}
+	}
+}
+
 // modelLister is the subset of the LM Studio client used to discover models.
 type modelLister interface {
 	ListVisionModels(ctx context.Context) ([]string, error)
