@@ -37,7 +37,7 @@ func TestValidatePlanRejects(t *testing.T) {
 		want   string
 	}{
 		{"unknown intent", func(p *Plan) { p.EditIntent = "documentary" }, "unknown edit intent"},
-		{"bad audio", func(p *Plan) { p.Audio.Source = "music" }, "unsupported audio source"},
+		{"bad audio", func(p *Plan) { p.Audio.Source = "podcast" }, "unsupported audio source"},
 		{"missing ranking", func(p *Plan) { p.Ranking = nil }, "missing ranking provenance"},
 		{"missing model", func(p *Plan) { p.Ranking.Model = "" }, "missing the ranking model"},
 		{"zero target", func(p *Plan) { p.Ranking.TargetSeconds = 0 }, "target duration"},

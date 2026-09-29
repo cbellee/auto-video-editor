@@ -58,13 +58,48 @@ func RenderPlan(ctx context.Context, options RenderOptions) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	music, err := resolvePlanMusic(plan, baseDir)
+	if err != nil {
+		return Result{}, err
+	}
 	if err := ensureAvailable(outputPath, options.Force); err != nil {
 		return Result{}, err
 	}
-	if err := renderPlanToFile(ctx, inputs, plan.Render, outputPath); err != nil {
+	if err := renderPlanToFile(ctx, inputs, music, plan.Render, outputPath); err != nil {
 		return Result{}, err
 	}
 	return Result{PlanPath: planPath, VideoPath: outputPath}, nil
+}
+
+// resolvePlanMusic resolves and fingerprint-checks the optional Music Track so
+// a rerender reproduces the exact audio bed the plan was built with. A plan
+// without music yields a nil bed and no error.
+func resolvePlanMusic(plan Plan, baseDir string) (*musicRender, error) {
+	if plan.Audio.Music == nil {
+		return nil, nil
+	}
+	music := plan.Audio.Music
+	if strings.TrimSpace(music.Path) == "" {
+		return nil, fmt.Errorf("the Edit Plan records a Music Track with no path")
+	}
+	if music.Fingerprint == "" {
+		return nil, fmt.Errorf("the Edit Plan is missing the Music Track fingerprint")
+	}
+	resolved := music.Path
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(baseDir, resolved)
+	}
+	actual, err := sourceFingerprint(resolved)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("the Music Track is missing (looked in %s)", resolved)
+		}
+		return nil, fmt.Errorf("%s: %w", music.Path, err)
+	}
+	if actual != music.Fingerprint {
+		return nil, fmt.Errorf("the Music Track %s changed since the Edit Plan was created", music.Path)
+	}
+	return &musicRender{path: resolved, fadeOut: music.FadeOutSeconds}, nil
 }
 
 func loadPlan(path string) (Plan, error) {
@@ -140,6 +175,7 @@ func verifyPlanSources(plan Plan, baseDir string) ([]renderInput, error) {
 func renderPlanToFile(
 	ctx context.Context,
 	inputs []renderInput,
+	music *musicRender,
 	settings RenderSettings,
 	outputPath string,
 ) (resultErr error) {
@@ -165,7 +201,7 @@ func renderPlanToFile(
 		}
 	}()
 
-	args := encodeArgs(inputs, settings)
+	args := encodeArgs(inputs, music, settings)
 	args = append(args, "-y", "-f", settings.Container, tempPath)
 	command := exec.CommandContext(ctx, "ffmpeg", args...)
 	output, err := command.CombinedOutput()

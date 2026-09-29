@@ -1758,6 +1758,20 @@ case "$AVE_TEST_FFPROBE_MODE" in
   malformed-duration) printf '{"format":{"duration":"unknown"}}\n'; exit ;;
   missing-capture) printf '{"streams":[{"width":1920,"height":1080}],"format":{"duration":"6.0","tags":{}}}\n'; exit ;;
 esac
+# Music Track duration probe: format=duration with a bare (nokey) output. Emit
+# only the number, keyed on filename markers so tests can control track length.
+case "$*" in
+  *noprint_wrappers*)
+    for music do :; done
+    case "$music" in
+      *tiny*) echo "3.0" ;;
+      *short*) echo "6.0" ;;
+      *long*) echo "300.0" ;;
+      *) echo "60.0" ;;
+    esac
+    exit 0
+    ;;
+esac
 for source do :; done
 case "$source" in
   *corrupt*) echo "ffprobe: corrupt input" >&2; exit 1 ;;
@@ -1900,6 +1914,33 @@ if [ -n "$AVE_TEST_FFMPEG_FAIL" ]; then
   exit 1
 fi
 printf 'finished video' > "$output"
+`)
+	writeExecutable(t, dir, "aubio", `#!/bin/sh
+# Fake aubio: prints one timestamp per line for the requested cue kind. Beats
+# land every 0.5s and onsets every 0.25s across a track length keyed on the
+# filename, so phrase (every 8 beats = 4s) and section (every 32 beats = 16s)
+# groupings are deterministic. Uses only POSIX shell arithmetic so it works
+# even when PATH is restricted to just the fake tool directory.
+sub="$1"
+for track do :; done
+case "$track" in
+  *short*) dur=6 ;;
+  *long*) dur=300 ;;
+  *) dur=60 ;;
+esac
+case "$sub" in
+  beat) parts=2 ;;   # 1/2 second grid
+  onset) parts=4 ;;  # 1/4 second grid
+  *) exit 0 ;;
+esac
+steps=$((dur * parts))
+i=0
+while [ "$i" -le "$steps" ]; do
+  whole=$((i / parts))
+  hundredths=$(((i % parts) * 100 / parts))
+  printf '%d.%02d\n' "$whole" "$hundredths"
+  i=$((i + 1))
+done
 `)
 	return dir
 }
