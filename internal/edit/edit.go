@@ -69,6 +69,9 @@ type Options struct {
 	// Theme optionally guides a thematic edit; when empty under thematic intent
 	// the model discovers a recurring theme.
 	Theme string
+	// Music is an optional path to a Music Track whose detected cues shape edit
+	// duration and cut timing and whose audio becomes the Finished Video bed.
+	Music string
 }
 
 // allowedFrameRates enumerates the output frame rates the MVP supports.
@@ -130,9 +133,11 @@ type RankingSettings struct {
 }
 
 // AudioSettings records the Finished Video audio decision. The baseline
-// chronological edit keeps each segment's source audio.
+// chronological edit keeps each segment's source audio; when a Music Track is
+// supplied, Source is "music" and Music carries the reproducible timing data.
 type AudioSettings struct {
-	Source string `json:"source"`
+	Source string         `json:"source"`
+	Music  *MusicSettings `json:"music,omitempty"`
 }
 
 // SegmentScore is the AI assessment of a Candidate Segment, retained in the
@@ -185,6 +190,9 @@ type SelectedSegment struct {
 	// ScoreRepaired reports whether the model's first response needed one
 	// schema-guided repair before it validated.
 	ScoreRepaired bool `json:"score_repaired,omitempty"`
+	// MusicCue records which Music Cue kind ("beat", "phrase", or "section")
+	// this segment's out-point was aligned to, or empty when it was not snapped.
+	MusicCue string `json:"music_cue,omitempty"`
 }
 
 // RenderSettings describes the baseline Finished Video encoding.
@@ -409,6 +417,11 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	theme := strings.TrimSpace(options.Theme)
 	rankingTheme := theme
 
+	music, err := resolveMusic(ctx, options)
+	if err != nil {
+		return Result{}, err
+	}
+
 	rankingClient := &ranker{client: client, model: model, intent: intent, guidance: options.Guidance, theme: theme}
 	ranked, err := rankingClient.rankAll(ctx, eligible)
 	if err != nil {
@@ -420,6 +433,11 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		durationSource = "override"
 	}
 	targetSeconds := automaticDuration(eligibleDuration, options.Duration)
+	if music != nil && targetSeconds > music.duration {
+		// A short Music Track shortens the automatic edit; the track is never
+		// looped to fill a longer target.
+		targetSeconds = music.duration
+	}
 	selected, droppedOut := selectChronological(ranked, targetSeconds)
 
 	themeSource := ""
@@ -437,17 +455,43 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		selected = orderThematic(selected)
 	}
 
+	snaps := make([]snappedCut, len(selected))
+	for index, candidate := range selected {
+		snaps[index] = snappedCut{end: candidate.rng.end}
+	}
+	if music != nil {
+		snaps = snapCutsToMusic(selected, music.cues)
+	}
+
 	segments := make([]SelectedSegment, 0, len(selected))
 	renderInputs := make([]renderInput, 0, len(selected))
 	var selectedDuration float64
-	for _, candidate := range selected {
+	for index, candidate := range selected {
 		score := scoreFrom(candidate)
+		segmentEnd := snaps[index].end
+		musicCue := snaps[index].cue
+		// Fit the edit to a short Music Track: whole-segment selection can
+		// overshoot the clamped target by up to one segment, but the Finished
+		// Video must never outlast the track (the tail would be silent and
+		// un-faded). Trim the segment that crosses the track length and drop
+		// any that would start past it, so the fade always lands on real audio.
+		if music != nil {
+			remaining := music.duration - selectedDuration
+			contributed := segmentEnd - candidate.rng.start
+			if remaining <= musicEpsilon {
+				break
+			}
+			if contributed > remaining+musicEpsilon {
+				segmentEnd = candidate.rng.start + remaining
+				musicCue = ""
+			}
+		}
 		segments = append(segments, SelectedSegment{
 			SourcePath:         candidate.relPath,
 			SourceFingerprint:  candidate.fingerprint,
 			SourceIsHDR:        candidate.isHDR,
 			StartSecond:        candidate.rng.start,
-			EndSecond:          candidate.rng.end,
+			EndSecond:          segmentEnd,
 			Metrics:            candidate.metrics,
 			Shaky:              candidate.shaky,
 			NeedsStabilization: candidate.needsStabilization,
@@ -456,14 +500,15 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			Score:              &score,
 			Prompt:             candidate.prompt,
 			ScoreRepaired:      candidate.repaired,
+			MusicCue:           musicCue,
 		})
 		renderInputs = append(renderInputs, renderInput{
 			path:  candidate.clipPath,
 			start: candidate.rng.start,
-			end:   candidate.rng.end,
+			end:   segmentEnd,
 			isHDR: candidate.isHDR,
 		})
-		selectedDuration += candidate.rng.end - candidate.rng.start
+		selectedDuration += segmentEnd - candidate.rng.start
 	}
 
 	rankedOut := make([]RankedOutSegment, 0, len(droppedOut))
@@ -480,6 +525,22 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	renderSettings, err := renderSettingsFor(ctx, outputOrientation, options.FrameRate)
 	if err != nil {
 		return Result{}, err
+	}
+	audioSettings := AudioSettings{Source: audioSource}
+	var musicBed *musicRender
+	if music != nil {
+		planDir := filepath.Dir(result.PlanPath)
+		audioSettings = AudioSettings{
+			Source: audioMusic,
+			Music: &MusicSettings{
+				Path:            planRelativePath(planDir, music.absPath),
+				Fingerprint:     music.fingerprint,
+				DurationSeconds: music.duration,
+				FadeOutSeconds:  musicFadeOutSeconds,
+				Cues:            music.cues,
+			},
+		}
+		musicBed = &musicRender{path: music.absPath, fadeOut: musicFadeOutSeconds}
 	}
 	plan := Plan{
 		Version:       planVersion,
@@ -502,7 +563,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			SelectedSecond: selectedDuration,
 			DurationSource: durationSource,
 		},
-		Audio:             AudioSettings{Source: audioSource},
+		Audio:             audioSettings,
 		SelectedSegments:  segments,
 		RankedOutSegments: rankedOut,
 		RejectedSegments:  rejected,
@@ -521,7 +582,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		result.VideoPath = ""
 		return result, nil
 	}
-	if err := render(ctx, renderInputs, result.VideoPath, renderSettings, options.Force); err != nil {
+	if err := render(ctx, renderInputs, musicBed, result.VideoPath, renderSettings, options.Force); err != nil {
 		return Result{}, err
 	}
 	fingerprint, err := fileSHA256(result.VideoPath)
@@ -963,11 +1024,12 @@ func renderSettingsFor(ctx context.Context, o orientation, frameRate int) (Rende
 func render(
 	ctx context.Context,
 	inputs []renderInput,
+	music *musicRender,
 	outputPath string,
 	settings RenderSettings,
 	force bool,
 ) error {
-	args := encodeArgs(inputs, settings)
+	args := encodeArgs(inputs, music, settings)
 	if force {
 		args = append(args, "-y")
 	} else {
@@ -995,8 +1057,9 @@ type renderInput struct {
 // location, device, and capture details never reach the Finished Video. Each
 // clip is fit onto the canvas without distortion and letterboxed with a blurred
 // copy of itself, HDR footage is tone mapped to SDR, and the result is tagged
-// Rec.709.
-func encodeArgs(inputs []renderInput, settings RenderSettings) []string {
+// Rec.709. When music is non-nil, its audio is trimmed to the edit length and
+// faded out to form the Finished Video's audio bed; otherwise the bed is silent.
+func encodeArgs(inputs []renderInput, music *musicRender, settings RenderSettings) []string {
 	args := []string{"-hide_banner", "-loglevel", "error"}
 
 	// Dedupe Source Clips: opening the same file as several -i inputs can
@@ -1021,15 +1084,19 @@ func encodeArgs(inputs []renderInput, settings RenderSettings) []string {
 		args = append(args, "-i", path)
 	}
 	audioInputIndex := len(uniquePaths)
-	args = append(
-		args,
-		"-f", "lavfi",
-		"-i", fmt.Sprintf(
-			"anullsrc=channel_layout=%s:sample_rate=%d",
-			settings.AudioChannelLayout,
-			settings.AudioSampleRate,
-		),
-	)
+	if music != nil {
+		args = append(args, "-i", music.path)
+	} else {
+		args = append(
+			args,
+			"-f", "lavfi",
+			"-i", fmt.Sprintf(
+				"anullsrc=channel_layout=%s:sample_rate=%d",
+				settings.AudioChannelLayout,
+				settings.AudioSampleRate,
+			),
+		)
+	}
 
 	var filter strings.Builder
 
@@ -1103,10 +1170,34 @@ func encodeArgs(inputs []renderInput, settings RenderSettings) []string {
 	}
 	fmt.Fprintf(&filter, "concat=n=%d:v=1:a=0[video]", len(inputs))
 
+	audioMap := fmt.Sprintf("%d:a:0", audioInputIndex)
+	if music != nil {
+		// Trim the Music Track to the edit length and fade its tail so a long
+		// track never ends abruptly; the track is never looped.
+		fmt.Fprintf(&filter,
+			";[%d:a:0]atrim=0:%s,asetpts=PTS-STARTPTS",
+			audioInputIndex,
+			strconv.FormatFloat(totalDuration, 'f', 6, 64),
+		)
+		if music.fadeOut > 0 {
+			fadeStart := totalDuration - music.fadeOut
+			if fadeStart < 0 {
+				fadeStart = 0
+			}
+			fmt.Fprintf(&filter,
+				",afade=t=out:st=%s:d=%s",
+				strconv.FormatFloat(fadeStart, 'f', 6, 64),
+				strconv.FormatFloat(music.fadeOut, 'f', 6, 64),
+			)
+		}
+		fmt.Fprintf(&filter, ",aresample=%d[audio]", settings.AudioSampleRate)
+		audioMap = "[audio]"
+	}
+
 	args = append(args,
 		"-filter_complex", filter.String(),
 		"-map", "[video]",
-		"-map", fmt.Sprintf("%d:a:0", audioInputIndex),
+		"-map", audioMap,
 		"-t", strconv.FormatFloat(totalDuration, 'f', 6, 64),
 		"-map_metadata", "-1",
 		"-c:v", settings.VideoCodec,

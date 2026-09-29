@@ -15,7 +15,7 @@ const (
 	exitSuccess = 0
 	exitFailure = 1
 	exitUsage   = 2
-	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force] [--fps <24|25|30|60>] [--aspect <landscape|portrait>] [--quality-profile <strict|balanced|lenient>] [--shake <reject|stabilize>] [--model <name>] [--guidance <text>] [--duration <seconds>] [--intent <chronological|thematic>] [--theme <text>]\n"
+	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force] [--fps <24|25|30|60>] [--aspect <landscape|portrait>] [--quality-profile <strict|balanced|lenient>] [--shake <reject|stabilize>] [--model <name>] [--guidance <text>] [--duration <seconds>] [--intent <chronological|thematic>] [--theme <text>] [--music <file>]\n"
 	renderUsage = "usage: ave render <plan.json> [--media-root <dir>] [--force]\n"
 )
 
@@ -175,6 +175,12 @@ func parseEditOptions(args []string) (edit.Options, error) {
 				return edit.Options{}, fmt.Errorf("--theme requires text")
 			}
 			options.Theme = args[index]
+		case "--music":
+			index++
+			if index >= len(args) || strings.HasPrefix(args[index], "-") {
+				return edit.Options{}, fmt.Errorf("--music requires a path to an audio file")
+			}
+			options.Music = args[index]
 		default:
 			if strings.HasPrefix(args[index], "-") {
 				return edit.Options{}, fmt.Errorf("unknown edit option %q", args[index])
