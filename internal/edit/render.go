@@ -65,10 +65,19 @@ func RenderPlan(ctx context.Context, options RenderOptions) (Result, error) {
 	if err := ensureAvailable(outputPath, options.Force); err != nil {
 		return Result{}, err
 	}
-	if err := renderPlanToFile(ctx, inputs, music, plan.Render, outputPath); err != nil {
+	if err := renderPlanToFile(ctx, inputs, music, planDuckProfile(plan), plan.Render, outputPath); err != nil {
 		return Result{}, err
 	}
 	return Result{PlanPath: planPath, VideoPath: outputPath}, nil
+}
+
+// planDuckProfile returns the music ducking profile recorded in the plan,
+// defaulting to balanced when a plan predates dialogue provenance.
+func planDuckProfile(plan Plan) string {
+	if plan.Audio.Dialogue != nil && plan.Audio.Dialogue.Ducking != "" {
+		return plan.Audio.Dialogue.Ducking
+	}
+	return duckBalanced
 }
 
 // resolvePlanMusic resolves and fingerprint-checks the optional Music Track so
@@ -158,7 +167,7 @@ func verifyPlanSources(plan Plan, baseDir string) ([]renderInput, error) {
 			problems = append(problems, fmt.Sprintf("%s: Source Clip changed since the Edit Plan was created", segment.SourcePath))
 			continue
 		}
-		inputs = append(inputs, renderInput{path: resolved, start: segment.StartSecond, end: segment.EndSecond, isHDR: segment.SourceIsHDR})
+		inputs = append(inputs, renderInput{path: resolved, start: segment.StartSecond, end: segment.EndSecond, isHDR: segment.SourceIsHDR, audioUsable: segment.Metrics.AudioUsable})
 	}
 	if len(problems) > 0 {
 		return nil, fmt.Errorf(
@@ -176,6 +185,7 @@ func renderPlanToFile(
 	ctx context.Context,
 	inputs []renderInput,
 	music *musicRender,
+	duckProfile string,
 	settings RenderSettings,
 	outputPath string,
 ) (resultErr error) {
@@ -201,7 +211,7 @@ func renderPlanToFile(
 		}
 	}()
 
-	args := encodeArgs(inputs, music, settings)
+	args := encodeArgs(inputs, music, duckProfile, settings)
 	args = append(args, "-y", "-f", settings.Container, tempPath)
 	command := exec.CommandContext(ctx, "ffmpeg", args...)
 	output, err := command.CombinedOutput()

@@ -76,6 +76,12 @@ type Options struct {
 	// "software"); empty selects "auto", which prefers VideoToolbox hardware
 	// H.264 and falls back to software H.264.
 	Encoder string
+	// Language overrides whisper.cpp speech-language detection ("auto" or a
+	// two-letter code such as "en"); empty selects "auto".
+	Language string
+	// Ducking selects how far a Music Track is lowered under source dialogue
+	// ("subtle", "balanced", or "strong"); empty selects "balanced".
+	Ducking string
 }
 
 // allowedFrameRates enumerates the output frame rates the MVP supports.
@@ -139,9 +145,41 @@ type RankingSettings struct {
 // AudioSettings records the Finished Video audio decision. The baseline
 // chronological edit keeps each segment's source audio; when a Music Track is
 // supplied, Source is "music" and Music carries the reproducible timing data.
+// Dialogue records the detected (or overridden) speech language and the music
+// ducking profile; Continuity records any J/L cuts that carry related dialogue
+// across a segment boundary.
 type AudioSettings struct {
-	Source string         `json:"source"`
-	Music  *MusicSettings `json:"music,omitempty"`
+	Source     string               `json:"source"`
+	Music      *MusicSettings       `json:"music,omitempty"`
+	Dialogue   *DialogueSettings    `json:"dialogue,omitempty"`
+	Continuity []DialogueContinuity `json:"continuity,omitempty"`
+}
+
+// DialogueSettings records the speech-analysis provenance for the Finished
+// Video: the transcription language, whether it was auto-detected or overridden
+// by the operator, and the music ducking profile applied so speech stays
+// intelligible over a Music Track.
+type DialogueSettings struct {
+	Language       string `json:"language"`
+	LanguageSource string `json:"language_source"`
+	Ducking        string `json:"ducking"`
+}
+
+// DialogueContinuity records a dialogue-carrying J-cut or L-cut: related speech
+// that bridges the boundary between two adjacent Selected Segments.
+type DialogueContinuity struct {
+	FromSegment int     `json:"from_segment"`
+	ToSegment   int     `json:"to_segment"`
+	Kind        string  `json:"kind"`
+	Seconds     float64 `json:"seconds"`
+}
+
+// DialogueSpan is a detected speech interval within a Selected Segment's source
+// range, retained as provenance for audio-aware cuts.
+type DialogueSpan struct {
+	StartSecond float64 `json:"start_seconds"`
+	EndSecond   float64 `json:"end_seconds"`
+	Text        string  `json:"text,omitempty"`
 }
 
 // SegmentScore is the AI assessment of a Candidate Segment, retained in the
@@ -197,6 +235,9 @@ type SelectedSegment struct {
 	// MusicCue records which Music Cue kind ("beat", "phrase", or "section")
 	// this segment's out-point was aligned to, or empty when it was not snapped.
 	MusicCue string `json:"music_cue,omitempty"`
+	// Dialogue are detected speech spans within this segment's source range,
+	// retained as provenance for audio-aware cuts and dialogue continuity.
+	Dialogue []DialogueSpan `json:"dialogue,omitempty"`
 }
 
 // RenderSettings describes the baseline Finished Video encoding.
@@ -479,6 +520,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 
 	segments := make([]SelectedSegment, 0, len(selected))
 	renderInputs := make([]renderInput, 0, len(selected))
+	dialogueClips := make([]dialogueClip, 0, len(selected))
 	var selectedDuration float64
 	for index, candidate := range selected {
 		score := scoreFrom(candidate)
@@ -517,10 +559,16 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			MusicCue:           musicCue,
 		})
 		renderInputs = append(renderInputs, renderInput{
+			path:        candidate.clipPath,
+			start:       candidate.rng.start,
+			end:         segmentEnd,
+			isHDR:       candidate.isHDR,
+			audioUsable: candidate.metrics.AudioUsable,
+		})
+		dialogueClips = append(dialogueClips, dialogueClip{
 			path:  candidate.clipPath,
 			start: candidate.rng.start,
 			end:   segmentEnd,
-			isHDR: candidate.isHDR,
 		})
 		selectedDuration += segmentEnd - candidate.rng.start
 	}
@@ -556,6 +604,24 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		}
 		musicBed = &musicRender{path: music.absPath, fadeOut: musicFadeOutSeconds}
 	}
+
+	duckProfile, err := normalizeDuckProfile(options.Ducking)
+	if err != nil {
+		return Result{}, err
+	}
+	language, languageSource, spans, err := transcribeDialogue(ctx, dialogueClips, options.Language)
+	if err != nil {
+		return Result{}, err
+	}
+	for index := range segments {
+		segments[index].Dialogue = spans[index]
+	}
+	audioSettings.Dialogue = &DialogueSettings{
+		Language:       language,
+		LanguageSource: languageSource,
+		Ducking:        duckProfile,
+	}
+	audioSettings.Continuity = detectContinuity(segments)
 	plan := Plan{
 		Version:       planVersion,
 		EditIntent:    intent,
@@ -596,7 +662,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		result.VideoPath = ""
 		return result, nil
 	}
-	if err := render(ctx, renderInputs, musicBed, result.VideoPath, renderSettings, options.Force); err != nil {
+	if err := render(ctx, renderInputs, musicBed, duckProfile, result.VideoPath, renderSettings, options.Force); err != nil {
 		return Result{}, err
 	}
 	fingerprint, err := fileSHA256(result.VideoPath)
@@ -1042,11 +1108,12 @@ func render(
 	ctx context.Context,
 	inputs []renderInput,
 	music *musicRender,
+	duckProfile string,
 	outputPath string,
 	settings RenderSettings,
 	force bool,
 ) error {
-	args := encodeArgs(inputs, music, settings)
+	args := encodeArgs(inputs, music, duckProfile, settings)
 	if force {
 		args = append(args, "-y")
 	} else {
@@ -1063,10 +1130,11 @@ func render(
 
 // renderInput is a resolved Source Clip range to include in a Finished Video.
 type renderInput struct {
-	path  string
-	start float64
-	end   float64
-	isHDR bool
+	path        string
+	start       float64
+	end         float64
+	isHDR       bool
+	audioUsable bool
 }
 
 // encodeArgs builds the FFmpeg arguments common to every render, excluding the
@@ -1076,7 +1144,7 @@ type renderInput struct {
 // copy of itself, HDR footage is tone mapped to SDR, and the result is tagged
 // Rec.709. When music is non-nil, its audio is trimmed to the edit length and
 // faded out to form the Finished Video's audio bed; otherwise the bed is silent.
-func encodeArgs(inputs []renderInput, music *musicRender, settings RenderSettings) []string {
+func encodeArgs(inputs []renderInput, music *musicRender, duckProfile string, settings RenderSettings) []string {
 	args := []string{"-hide_banner", "-loglevel", "error"}
 
 	// Dedupe Source Clips: opening the same file as several -i inputs can
@@ -1097,13 +1165,30 @@ func encodeArgs(inputs []renderInput, music *musicRender, settings RenderSetting
 	for _, input := range inputs {
 		totalDuration += input.end - input.start
 	}
+	silentCount := 0
+	for _, input := range inputs {
+		if !input.audioUsable {
+			silentCount++
+		}
+	}
 	for _, path := range uniquePaths {
 		args = append(args, "-i", path)
 	}
-	audioInputIndex := len(uniquePaths)
+	musicInputIndex := -1
 	if music != nil {
+		musicInputIndex = len(uniquePaths)
 		args = append(args, "-i", music.path)
-	} else {
+	}
+	// A silent source backs any Selected Segment whose source audio is unusable,
+	// so bad audio is muted without discarding the visual segment. It is only
+	// added when at least one segment needs it, so a fully-usable edit never
+	// carries a stray silent input.
+	silentInputIndex := -1
+	if silentCount > 0 {
+		silentInputIndex = len(uniquePaths)
+		if music != nil {
+			silentInputIndex++
+		}
 		args = append(
 			args,
 			"-f", "lavfi",
@@ -1185,31 +1270,61 @@ func encodeArgs(inputs []renderInput, music *musicRender, settings RenderSetting
 	for index := range inputs {
 		fmt.Fprintf(&filter, "[v%d]", index)
 	}
-	fmt.Fprintf(&filter, "concat=n=%d:v=1:a=0[video]", len(inputs))
+	fmt.Fprintf(&filter, "concat=n=%d:v=1:a=0[video];", len(inputs))
 
-	audioMap := fmt.Sprintf("%d:a:0", audioInputIndex)
-	if music != nil {
-		// Trim the Music Track to the edit length and fade its tail so a long
-		// track never ends abruptly; the track is never looped.
-		fmt.Fprintf(&filter,
-			";[%d:a:0]atrim=0:%s,asetpts=PTS-STARTPTS",
-			audioInputIndex,
-			strconv.FormatFloat(totalDuration, 'f', 6, 64),
-		)
-		if music.fadeOut > 0 {
-			fadeStart := totalDuration - music.fadeOut
-			if fadeStart < 0 {
-				fadeStart = 0
-			}
-			fmt.Fprintf(&filter,
-				",afade=t=out:st=%s:d=%s",
-				strconv.FormatFloat(fadeStart, 'f', 6, 64),
-				strconv.FormatFloat(music.fadeOut, 'f', 6, 64),
-			)
+	// Build the source-audio bed: split each input's audio and the silent
+	// source into one branch per consuming segment, then hand the ordered
+	// segment plans to buildAudioFilter for crossfade, normalization, optional
+	// music ducking, and clip protection.
+	audioUsableCount := make(map[string]int)
+	for _, input := range inputs {
+		if input.audioUsable {
+			audioUsableCount[input.path]++
 		}
-		fmt.Fprintf(&filter, ",aresample=%d[audio]", settings.AudioSampleRate)
-		audioMap = "[audio]"
 	}
+	for unique, path := range uniquePaths {
+		count := audioUsableCount[path]
+		if count == 0 {
+			continue
+		}
+		fmt.Fprintf(&filter, "[%d:a:0]asplit=%d", unique, count)
+		for branch := 0; branch < count; branch++ {
+			fmt.Fprintf(&filter, "[a_%d_%d]", unique, branch)
+		}
+		filter.WriteString(";")
+	}
+	if silentCount > 0 {
+		fmt.Fprintf(&filter, "[%d:a:0]asplit=%d", silentInputIndex, silentCount)
+		for branch := 0; branch < silentCount; branch++ {
+			fmt.Fprintf(&filter, "[sil_%d]", branch)
+		}
+		filter.WriteString(";")
+	}
+
+	plans := make([]audioSegmentPlan, len(inputs))
+	nextAudioBranch := make(map[string]int)
+	nextSilent := 0
+	for index, input := range inputs {
+		if input.audioUsable {
+			unique := inputIndex[input.path]
+			branch := nextAudioBranch[input.path]
+			nextAudioBranch[input.path]++
+			plans[index] = audioSegmentPlan{
+				label: fmt.Sprintf("a_%d_%d", unique, branch),
+				start: input.start,
+				end:   input.end,
+			}
+			continue
+		}
+		plans[index] = audioSegmentPlan{
+			label:  fmt.Sprintf("sil_%d", nextSilent),
+			start:  input.start,
+			end:    input.end,
+			silent: true,
+		}
+		nextSilent++
+	}
+	audioMap := buildAudioFilter(&filter, plans, music, musicInputIndex, duckProfile, totalDuration, settings)
 
 	args = append(args,
 		"-filter_complex", filter.String(),
