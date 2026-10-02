@@ -23,6 +23,24 @@ const DefaultBaseURL = "http://127.0.0.1:1234"
 // baseURLEnv overrides the LM Studio server location.
 const baseURLEnv = "AVE_LM_STUDIO_URL"
 
+// timeoutEnv overrides the per-request timeout, chiefly so tests can prove
+// timeout handling without waiting for the production default.
+const timeoutEnv = "AVE_LM_STUDIO_TIMEOUT"
+
+// defaultTimeout bounds how long ave waits on a local model before giving up.
+const defaultTimeout = 120 * time.Second
+
+// resolveTimeout returns the configured request timeout, honoring timeoutEnv
+// when it holds a positive Go duration and falling back to defaultTimeout.
+func resolveTimeout() time.Duration {
+	if raw := os.Getenv(timeoutEnv); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return defaultTimeout
+}
+
 // Client talks to a loopback LM Studio server.
 type Client struct {
 	baseURL string
@@ -40,7 +58,7 @@ func New(baseURL string) (*Client, error) {
 		return nil, fmt.Errorf("LM Studio host %q is not loopback; refusing to send media off the machine", parsed.Hostname())
 	}
 	client := &http.Client{
-		Timeout: 120 * time.Second,
+		Timeout: resolveTimeout(),
 		CheckRedirect: func(request *http.Request, _ []*http.Request) error {
 			if !IsLoopback(request.URL.Hostname()) {
 				return fmt.Errorf("refusing redirect to non-loopback host %q", request.URL.Hostname())

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewRejectsNonLoopback(t *testing.T) {
@@ -226,5 +227,26 @@ func TestDiscoverThemeFailsAfterRepairAttempt(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "repair") {
 		t.Errorf("error should mention the repair attempt: %v", err)
+	}
+}
+
+func TestResolveTimeoutHonorsEnv(t *testing.T) {
+	if got := resolveTimeout(); got != defaultTimeout {
+		t.Errorf("default timeout = %v, want %v", got, defaultTimeout)
+	}
+
+	t.Setenv(timeoutEnv, "250ms")
+	if got := resolveTimeout(); got != 250*time.Millisecond {
+		t.Errorf("env timeout = %v, want 250ms", got)
+	}
+
+	t.Setenv(timeoutEnv, "not-a-duration")
+	if got := resolveTimeout(); got != defaultTimeout {
+		t.Errorf("invalid env timeout = %v, want fallback %v", got, defaultTimeout)
+	}
+
+	t.Setenv(timeoutEnv, "-5s")
+	if got := resolveTimeout(); got != defaultTimeout {
+		t.Errorf("non-positive env timeout = %v, want fallback %v", got, defaultTimeout)
 	}
 }
