@@ -151,7 +151,9 @@ func TestEditCreatesChronologicalPlanAndFinishedVideo(t *testing.T) {
 	for _, want := range []string{
 		"-filter_complex",
 		"concat=n=2:v=1:a=0[video]",
-		"anullsrc=channel_layout=stereo:sample_rate=48000",
+		"loudnorm=I=-16.0:TP=-1.5:LRA=11.0",
+		"acrossfade=d=0.250000",
+		"alimiter=limit=0.95",
 		"-c:v libx264",
 		"-c:a aac",
 		"-f mp4",
@@ -160,6 +162,9 @@ func TestEditCreatesChronologicalPlanAndFinishedVideo(t *testing.T) {
 		if !strings.Contains(string(ffmpegLog), want) {
 			t.Errorf("FFmpeg invocation does not contain %q:\n%s", want, ffmpegLog)
 		}
+	}
+	if strings.Contains(string(ffmpegLog), "anullsrc") {
+		t.Errorf("baseline edit with usable audio must not use a silent bed:\n%s", ffmpegLog)
 	}
 	for _, want := range []string{"Edit Plan:", planPath, "Finished Video:", videoPath} {
 		if !strings.Contains(output, want) {
@@ -1819,6 +1824,15 @@ case "$*" in
     exit 0
     ;;
 esac
+# Dialogue WAV extraction for whisper.cpp: 16 kHz mono audio to a .wav sink.
+# Create the sink without touching the render log so render assertions hold.
+case "$*" in
+  *"-ar 16000"*)
+    for output do :; done
+    printf 'WAVDATA' > "$output"
+    exit 0
+    ;;
+esac
 # Analysis metadata passes (scene detection + per-candidate metrics) write to a
 # metadata=print sink and use the null muxer. Detect the sink path and source,
 # then emit deterministic detector output keyed on filename markers.
@@ -1941,6 +1955,26 @@ while [ "$i" -le "$steps" ]; do
   printf '%d.%02d\n' "$whole" "$hundredths"
   i=$((i + 1))
 done
+`)
+	writeExecutable(t, dir, "whisper-cli", `#!/bin/sh
+# Fake whisper.cpp: writes <prefix>.json with a detected language and three
+# one-second utterances so dialogue spans cover a typical six-second clip end
+# to end (letting adjacent segments form dialogue continuity). Honors an
+# explicit -l override and an AVE_TEST_WHISPER_LANG detection override. Uses
+# only shell builtins because PATH is restricted to the fake tool directory.
+of=""
+lang="auto"
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    -of) of="$a" ;;
+    -l) lang="$a" ;;
+  esac
+  prev="$a"
+done
+detected="${AVE_TEST_WHISPER_LANG:-en}"
+if [ "$lang" != "auto" ]; then detected="$lang"; fi
+printf '{"result":{"language":"%s"},"transcription":[{"offsets":{"from":0,"to":2000},"text":"one"},{"offsets":{"from":2000,"to":4000},"text":"two"},{"offsets":{"from":4000,"to":6000},"text":"three"}]}\n' "$detected" > "$of.json"
 `)
 	return dir
 }

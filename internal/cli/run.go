@@ -15,7 +15,7 @@ const (
 	exitSuccess = 0
 	exitFailure = 1
 	exitUsage   = 2
-	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force] [--fps <24|25|30|60>] [--aspect <landscape|portrait>] [--quality-profile <strict|balanced|lenient>] [--shake <reject|stabilize>] [--model <name>] [--guidance <text>] [--duration <seconds>] [--intent <chronological|thematic>] [--theme <text>] [--music <file>] [--encoder <auto|hardware|software>]\n"
+	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force] [--fps <24|25|30|60>] [--aspect <landscape|portrait>] [--quality-profile <strict|balanced|lenient>] [--shake <reject|stabilize>] [--model <name>] [--guidance <text>] [--duration <seconds>] [--intent <chronological|thematic>] [--theme <text>] [--music <file>] [--encoder <auto|hardware|software>] [--language <auto|code>] [--duck <subtle|balanced|strong>]\n"
 	renderUsage = "usage: ave render <plan.json> [--media-root <dir>] [--force]\n"
 )
 
@@ -191,6 +191,23 @@ func parseEditOptions(args []string) (edit.Options, error) {
 				options.Encoder = args[index]
 			default:
 				return edit.Options{}, fmt.Errorf("invalid --encoder value %q; use auto, hardware, or software", args[index])
+			}
+		case "--language":
+			index++
+			if index >= len(args) || strings.HasPrefix(args[index], "-") {
+				return edit.Options{}, fmt.Errorf("--language requires auto or a language code such as en")
+			}
+			options.Language = args[index]
+		case "--duck":
+			index++
+			if index >= len(args) || strings.HasPrefix(args[index], "-") {
+				return edit.Options{}, fmt.Errorf("--duck requires subtle, balanced, or strong")
+			}
+			switch args[index] {
+			case "subtle", "balanced", "strong":
+				options.Ducking = args[index]
+			default:
+				return edit.Options{}, fmt.Errorf("invalid --duck value %q; use subtle, balanced, or strong", args[index])
 			}
 		default:
 			if strings.HasPrefix(args[index], "-") {

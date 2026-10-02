@@ -47,6 +47,9 @@ func validatePlan(plan Plan) error {
 	if err := validateMusic(plan.Audio); err != nil {
 		return err
 	}
+	if err := validateDialogue(plan.Audio); err != nil {
+		return err
+	}
 	if plan.Ranking == nil {
 		return fmt.Errorf("plan is missing ranking provenance")
 	}
@@ -84,6 +87,52 @@ func validatePlan(plan Plan) error {
 	for source, segments := range perSource {
 		if err := rejectOverlaps(source, segments); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// dialogue continuity kinds record how related speech bridges a cut.
+const (
+	continuityJCut = "J-cut"
+	continuityLCut = "L-cut"
+)
+
+// knownLanguageSources enumerates how a dialogue language was decided.
+var knownLanguageSources = map[string]bool{"detected": true, "override": true}
+
+// knownContinuityKinds enumerates the dialogue-carrying cut kinds.
+var knownContinuityKinds = map[string]bool{continuityJCut: true, continuityLCut: true}
+
+// validateDialogue enforces the speech-analysis provenance: a known language
+// source, a supported ducking profile, and well-formed continuity records.
+func validateDialogue(audio AudioSettings) error {
+	if audio.Dialogue == nil {
+		if len(audio.Continuity) > 0 {
+			return fmt.Errorf("dialogue continuity recorded without dialogue settings")
+		}
+		return nil
+	}
+	dialogue := audio.Dialogue
+	if strings.TrimSpace(dialogue.Language) == "" {
+		return fmt.Errorf("dialogue is missing its language")
+	}
+	if !knownLanguageSources[dialogue.LanguageSource] {
+		return fmt.Errorf("dialogue has unsupported language source %q", dialogue.LanguageSource)
+	}
+	if !knownDuckProfiles[dialogue.Ducking] {
+		return fmt.Errorf("dialogue has unsupported ducking profile %q", dialogue.Ducking)
+	}
+	for index, cut := range audio.Continuity {
+		if !knownContinuityKinds[cut.Kind] {
+			return fmt.Errorf("dialogue continuity %d has unsupported kind %q", index, cut.Kind)
+		}
+		if cut.Seconds <= 0 {
+			return fmt.Errorf("dialogue continuity %d duration %.2fs must be positive", index, cut.Seconds)
+		}
+		if cut.ToSegment != cut.FromSegment+1 {
+			return fmt.Errorf("dialogue continuity %d must bridge adjacent segments, got %d to %d",
+				index, cut.FromSegment, cut.ToSegment)
 		}
 	}
 	return nil
