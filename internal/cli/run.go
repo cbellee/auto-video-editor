@@ -15,7 +15,7 @@ const (
 	exitSuccess = 0
 	exitFailure = 1
 	exitUsage   = 2
-	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force] [--fps <24|25|30|60>] [--aspect <landscape|portrait>] [--quality-profile <strict|balanced|lenient>] [--shake <reject|stabilize>] [--model <name>] [--guidance <text>] [--duration <seconds>] [--intent <chronological|thematic>] [--theme <text>] [--music <file>]\n"
+	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force] [--fps <24|25|30|60>] [--aspect <landscape|portrait>] [--quality-profile <strict|balanced|lenient>] [--shake <reject|stabilize>] [--model <name>] [--guidance <text>] [--duration <seconds>] [--intent <chronological|thematic>] [--theme <text>] [--music <file>] [--encoder <auto|hardware|software>]\n"
 	renderUsage = "usage: ave render <plan.json> [--media-root <dir>] [--force]\n"
 )
 
@@ -181,6 +181,17 @@ func parseEditOptions(args []string) (edit.Options, error) {
 				return edit.Options{}, fmt.Errorf("--music requires a path to an audio file")
 			}
 			options.Music = args[index]
+		case "--encoder":
+			index++
+			if index >= len(args) || strings.HasPrefix(args[index], "-") {
+				return edit.Options{}, fmt.Errorf("--encoder requires auto, hardware, or software")
+			}
+			switch args[index] {
+			case "auto", "hardware", "software":
+				options.Encoder = args[index]
+			default:
+				return edit.Options{}, fmt.Errorf("invalid --encoder value %q; use auto, hardware, or software", args[index])
+			}
 		default:
 			if strings.HasPrefix(args[index], "-") {
 				return edit.Options{}, fmt.Errorf("unknown edit option %q", args[index])

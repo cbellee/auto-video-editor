@@ -72,6 +72,10 @@ type Options struct {
 	// Music is an optional path to a Music Track whose detected cues shape edit
 	// duration and cut timing and whose audio becomes the Finished Video bed.
 	Music string
+	// Encoder selects the H.264 encoder strategy ("auto", "hardware", or
+	// "software"); empty selects "auto", which prefers VideoToolbox hardware
+	// H.264 and falls back to software H.264.
+	Encoder string
 }
 
 // allowedFrameRates enumerates the output frame rates the MVP supports.
@@ -208,6 +212,16 @@ type RenderSettings struct {
 	AudioChannels      int    `json:"audio_channels"`
 	AudioChannelLayout string `json:"audio_channel_layout"`
 	FastStart          bool   `json:"fast_start"`
+	// EncoderMode is the requested H.264 strategy ("auto", "hardware", or
+	// "software") that resolved to VideoCodec.
+	EncoderMode string `json:"encoder_mode,omitempty"`
+	// VideoCRF is the constant-rate-factor quality target for software H.264
+	// (libx264); zero when a bitrate target is used instead.
+	VideoCRF int `json:"video_crf,omitempty"`
+	// VideoBitrate is the explicit bitrate target (e.g. "2800k") for hardware
+	// H.264 (VideoToolbox), keeping Finished Video size comparable to software
+	// rather than defaulting to a much larger file; empty when CRF is used.
+	VideoBitrate string `json:"video_bitrate,omitempty"`
 }
 
 // validate reports whether the render settings are complete enough to drive
@@ -522,7 +536,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		})
 	}
 
-	renderSettings, err := renderSettingsFor(ctx, outputOrientation, options.FrameRate)
+	renderSettings, err := renderSettingsFor(ctx, outputOrientation, options.FrameRate, options.Encoder)
 	if err != nil {
 		return Result{}, err
 	}
@@ -978,12 +992,17 @@ func canvasDimensions(o orientation) (int, int) {
 	return 1920, 1080
 }
 
-func renderSettingsFor(ctx context.Context, o orientation, frameRate int) (RenderSettings, error) {
+func renderSettingsFor(ctx context.Context, o orientation, frameRate int, encoderMode string) (RenderSettings, error) {
 	if frameRate == 0 {
 		frameRate = defaultFrameRate
 	}
 	if !allowedFrameRates[frameRate] {
 		return RenderSettings{}, fmt.Errorf("unsupported frame rate %d; use 24, 25, 30, or 60", frameRate)
+	}
+
+	mode, err := normalizeEncoderMode(encoderMode)
+	if err != nil {
+		return RenderSettings{}, err
 	}
 
 	output, err := exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-encoders").CombinedOutput()
@@ -995,18 +1014,13 @@ func renderSettingsFor(ctx context.Context, o orientation, frameRate int) (Rende
 		)
 	}
 	encoders := ffmpeg.CapabilityNames(string(output))
-	videoCodec := ""
-	switch {
-	case encoders["h264_videotoolbox"]:
-		videoCodec = "h264_videotoolbox"
-	case encoders["libx264"]:
-		videoCodec = "libx264"
-	default:
-		return RenderSettings{}, fmt.Errorf("FFmpeg does not provide a supported H.264 encoder")
+	videoCodec, err := resolveVideoEncoder(mode, encoders)
+	if err != nil {
+		return RenderSettings{}, err
 	}
 
 	width, height := canvasDimensions(o)
-	return RenderSettings{
+	settings := RenderSettings{
 		Container:          "mp4",
 		VideoCodec:         videoCodec,
 		AudioCodec:         "aac",
@@ -1018,7 +1032,10 @@ func renderSettingsFor(ctx context.Context, o orientation, frameRate int) (Rende
 		AudioChannels:      2,
 		AudioChannelLayout: "stereo",
 		FastStart:          true,
-	}, nil
+		EncoderMode:        mode,
+	}
+	applyQualityTarget(&settings)
+	return settings, nil
 }
 
 func render(
@@ -1201,6 +1218,9 @@ func encodeArgs(inputs []renderInput, music *musicRender, settings RenderSetting
 		"-t", strconv.FormatFloat(totalDuration, 'f', 6, 64),
 		"-map_metadata", "-1",
 		"-c:v", settings.VideoCodec,
+	)
+	args = append(args, videoQualityArgs(settings)...)
+	args = append(args,
 		"-pix_fmt", settings.PixelFormat,
 		"-color_primaries", "bt709",
 		"-color_trc", "bt709",
