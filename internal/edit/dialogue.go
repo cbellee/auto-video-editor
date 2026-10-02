@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+
+	"github.com/cbellee/auto-video-editor/internal/cache"
 )
 
 // whisperBinaries lists the whisper.cpp CLI names ave will use to transcribe
@@ -105,6 +107,20 @@ func transcribeClip(ctx context.Context, binary string, clip dialogueClip, langu
 		return "", nil, fmt.Errorf("dialogue window %.2f-%.2f is empty", clip.start, clip.end)
 	}
 
+	// Reuse a cached transcript when the clip content, window, and language are
+	// unchanged so a resumed run does not re-extract audio and re-run whisper.
+	var cacheKey string
+	if fingerprint, err := sourceFingerprint(clip.path); err == nil {
+		cacheKey = cache.Key("transcript", fingerprint, map[string]string{
+			"language": language,
+			"start":    formatSeconds(clip.start),
+			"end":      formatSeconds(clip.end),
+		})
+		if stored, ok := cache.Load[cachedTranscript](cacheKey); ok {
+			return stored.Language, stored.Spans, nil
+		}
+	}
+
 	wavPath, cleanup, err := tempWavFile()
 	if err != nil {
 		return "", nil, err
@@ -156,7 +172,17 @@ func transcribeClip(ctx context.Context, binary string, clip dialogueClip, langu
 			Text:        strings.TrimSpace(utterance.Text),
 		})
 	}
-	return strings.TrimSpace(transcript.Result.Language), spans, nil
+	detected := strings.TrimSpace(transcript.Result.Language)
+	if cacheKey != "" {
+		_ = cache.Store(cacheKey, cachedTranscript{Language: detected, Spans: spans})
+	}
+	return detected, spans, nil
+}
+
+// cachedTranscript is the serializable transcript of one dialogue window.
+type cachedTranscript struct {
+	Language string         `json:"language"`
+	Spans    []DialogueSpan `json:"spans"`
 }
 
 // tempWavFile creates a temporary WAV sink and returns its path plus cleanup.
