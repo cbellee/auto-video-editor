@@ -138,6 +138,27 @@ func automaticDuration(eligibleSeconds, override float64) float64 {
 // penalizing near-duplicates, then returns them in capture order alongside the
 // candidates dropped for diversity. Chronology is always preserved in the
 // returned selection.
+// highInterestShakyThreshold is the minimum model Visual Interest a shaky
+// candidate must reach to be worth stabilizing. Footage below the bar is
+// dropped rather than smoothed; average-or-better footage is retained.
+// Non-shaky candidates are never filtered here.
+const highInterestShakyThreshold = 0.5
+
+// retainHighInterestShaky drops shaky candidates whose model Visual Interest is
+// below the high-interest bar, so stabilize mode spends effort only on footage
+// worth keeping. Steady candidates always pass through. The dropped shaky
+// candidates are returned so the caller can record why they were rejected.
+func retainHighInterestShaky(candidates []rankedCandidate) (kept, dropped []rankedCandidate) {
+	for _, candidate := range candidates {
+		if candidate.shaky && candidate.score.VisualInterest < highInterestShakyThreshold {
+			dropped = append(dropped, candidate)
+			continue
+		}
+		kept = append(kept, candidate)
+	}
+	return kept, dropped
+}
+
 func selectChronological(candidates []rankedCandidate, targetSeconds float64) (selected, dropped []rankedCandidate) {
 	byScore := make([]rankedCandidate, len(candidates))
 	copy(byScore, candidates)
