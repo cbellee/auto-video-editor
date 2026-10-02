@@ -82,6 +82,17 @@ type Options struct {
 	// Ducking selects how far a Music Track is lowered under source dialogue
 	// ("subtle", "balanced", or "strong"); empty selects "balanced".
 	Ducking string
+	// Jobs bounds the number of Source Clips analyzed in parallel; 0 selects an
+	// automatic bound derived from the machine's CPU count. Large-model ranking
+	// requests are always serialized regardless of this value.
+	Jobs int
+	// Progress receives human-readable progress lines; nil discards them.
+	Progress io.Writer
+	// Verbose adds subprocess-level detail to progress; Quiet suppresses all
+	// progress, leaving only errors and the final result. They are mutually
+	// exclusive.
+	Verbose bool
+	Quiet   bool
 }
 
 // allowedFrameRates enumerates the output frame rates the MVP supports.
@@ -329,6 +340,7 @@ func (c sourceClip) orientation() orientation {
 
 // Run creates a baseline Chronological Edit Plan and optionally renders it.
 func Run(ctx context.Context, options Options) (Result, error) {
+	report := newProgressReporter(options.Progress, options.Verbose, options.Quiet)
 	sourceDir, err := filepath.Abs(options.SourceDir)
 	if err != nil {
 		return Result{}, fmt.Errorf("resolve source folder: %w", err)
@@ -411,21 +423,26 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	}
 
 	planDir := filepath.Dir(result.PlanPath)
+	requestedJobs := options.Jobs
+	if requestedJobs > 0 {
+		rememberJobs(requestedJobs)
+	} else {
+		requestedJobs = rememberedJobs()
+	}
+	jobs := resolveJobs(requestedJobs)
+	report.Stage("Analyzing %d Source Clip(s) with up to %d parallel job(s)", len(clips), jobs)
+	analyses, err := analyzeClipsParallel(ctx, clips, analysis, jobs, report)
+	if err != nil {
+		return Result{}, err
+	}
+
 	var eligible []eligibleCandidate
 	var rejected []RejectedSegment
 	var eligibleDuration float64
 	order := 0
-	for _, clip := range clips {
-		fingerprint, fingerprintErr := sourceFingerprint(clip.path)
-		if fingerprintErr != nil {
-			return Result{}, fingerprintErr
-		}
-		candidates, analyzeErr := analyzeClip(ctx, clip.path, clip, analysis)
-		if analyzeErr != nil {
-			return Result{}, analyzeErr
-		}
-		relPath := planRelativePath(planDir, clip.path)
-		for _, candidate := range candidates {
+	for _, analyzed := range analyses {
+		relPath := planRelativePath(planDir, analyzed.clip.path)
+		for _, candidate := range analyzed.candidates {
 			duration := candidate.rng.end - candidate.rng.start
 			if !candidate.gate.eligible {
 				rejected = append(rejected, RejectedSegment{
@@ -439,10 +456,10 @@ func Run(ctx context.Context, options Options) (Result, error) {
 				continue
 			}
 			eligible = append(eligible, eligibleCandidate{
-				clipPath:           clip.path,
+				clipPath:           analyzed.clip.path,
 				relPath:            relPath,
-				fingerprint:        fingerprint,
-				isHDR:              clip.isHDR,
+				fingerprint:        analyzed.fingerprint,
+				isHDR:              analyzed.clip.isHDR,
 				rng:                candidate.rng,
 				metrics:            candidate.metrics,
 				shaky:              candidate.gate.shaky,
@@ -481,7 +498,11 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	if music != nil {
+		report.Stage("Analyzed Music Track cues (%d beats)", len(music.cues.Beats))
+	}
 
+	report.Stage("Ranking %d eligible segment(s) with model %s", len(eligible), model)
 	rankingClient := &ranker{client: client, model: model, intent: intent, guidance: options.Guidance, theme: theme}
 	ranked, err := rankingClient.rankAll(ctx, eligible)
 	if err != nil {
@@ -686,11 +707,13 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		return Result{}, err
 	}
 	rememberModel(model)
+	report.Stage("Wrote Edit Plan: %s", result.PlanPath)
 
 	if options.PlanOnly {
 		result.VideoPath = ""
 		return result, nil
 	}
+	report.Stage("Rendering Finished Video: %s", result.VideoPath)
 	if err := render(ctx, renderInputs, musicBed, duckProfile, result.VideoPath, renderSettings, options.Force); err != nil {
 		return Result{}, err
 	}

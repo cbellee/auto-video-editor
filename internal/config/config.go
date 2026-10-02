@@ -17,6 +17,10 @@ type Config struct {
 	// LastModel is the vision model key that most recently produced a
 	// successful ranking, remembered to reduce interactive prompting.
 	LastModel string `json:"last_model,omitempty"`
+	// DefaultJobs is the operational parallelism remembered from the most
+	// recent explicit --jobs choice, applied to later runs that do not set it.
+	// It is operational, not creative, so it persists between runs.
+	DefaultJobs int `json:"default_jobs,omitempty"`
 }
 
 // dirEnv overrides the configuration directory, primarily for tests.

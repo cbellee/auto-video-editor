@@ -110,10 +110,31 @@ func rememberedModel() string {
 	return cfg.LastModel
 }
 
-// rememberModel persists model as the last-successful choice, ignoring storage
-// errors so a successful edit is never failed by a config write problem.
+// rememberModel persists model as the last-successful choice while preserving
+// other operational defaults, ignoring storage errors so a successful edit is
+// never failed by a config write problem.
 func rememberModel(model string) {
-	_ = config.Save(config.Config{LastModel: model})
+	cfg, _ := config.Load()
+	cfg.LastModel = model
+	_ = config.Save(cfg)
+}
+
+// rememberedJobs returns the persisted operational parallelism default, or 0
+// (automatic) when none is stored or the store cannot be read.
+func rememberedJobs() int {
+	cfg, err := config.Load()
+	if err != nil {
+		return 0
+	}
+	return cfg.DefaultJobs
+}
+
+// rememberJobs persists an explicit --jobs choice as the operational default,
+// preserving other settings and ignoring storage errors.
+func rememberJobs(jobs int) {
+	cfg, _ := config.Load()
+	cfg.DefaultJobs = jobs
+	_ = config.Save(cfg)
 }
 
 // scoreFrom projects a ranked candidate's model assessment into the plan's

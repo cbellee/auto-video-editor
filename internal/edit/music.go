@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/cbellee/auto-video-editor/internal/cache"
 )
 
 const (
@@ -96,11 +98,17 @@ func resolveMusic(ctx context.Context, options Options) (*musicAnalysis, error) 
 
 // analyzeMusicTrack fingerprints the Music Track, measures its length, and
 // detects its Music Cues. A missing or unreadable track is a hard error: the
-// user asked for music, so ave does not silently continue without it.
+// user asked for music, so ave does not silently continue without it. A valid
+// cached analysis for the same track content is reused so a resumed run does
+// not re-run ffprobe and aubio over an unchanged Music Track.
 func analyzeMusicTrack(ctx context.Context, absPath string) (musicAnalysis, error) {
 	fingerprint, err := sourceFingerprint(absPath)
 	if err != nil {
 		return musicAnalysis{}, fmt.Errorf("fingerprint Music Track: %w", err)
+	}
+	key := cache.Key("music", fingerprint, nil)
+	if stored, ok := cache.Load[cachedMusic](key); ok {
+		return musicAnalysis{absPath: absPath, fingerprint: fingerprint, duration: stored.Duration, cues: stored.Cues}, nil
 	}
 	duration, err := probeMusicDuration(ctx, absPath)
 	if err != nil {
@@ -110,7 +118,14 @@ func analyzeMusicTrack(ctx context.Context, absPath string) (musicAnalysis, erro
 	if err != nil {
 		return musicAnalysis{}, err
 	}
+	_ = cache.Store(key, cachedMusic{Duration: duration, Cues: cues})
 	return musicAnalysis{absPath: absPath, fingerprint: fingerprint, duration: duration, cues: cues}, nil
+}
+
+// cachedMusic is the serializable Music Track analysis written to the cache.
+type cachedMusic struct {
+	Duration float64   `json:"duration"`
+	Cues     MusicCues `json:"cues"`
 }
 
 // probeMusicDuration reads the Music Track length with ffprobe.

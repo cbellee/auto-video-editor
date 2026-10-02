@@ -15,7 +15,7 @@ const (
 	exitSuccess = 0
 	exitFailure = 1
 	exitUsage   = 2
-	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force] [--fps <24|25|30|60>] [--aspect <landscape|portrait>] [--quality-profile <strict|balanced|lenient>] [--shake <reject|stabilize>] [--model <name>] [--guidance <text>] [--duration <seconds>] [--intent <chronological|thematic>] [--theme <text>] [--music <file>] [--encoder <auto|hardware|software>] [--language <auto|code>] [--duck <subtle|balanced|strong>]\n"
+	editUsage   = "usage: ave edit <folder> [--output <file>] [--plan-only] [--force] [--jobs <n>] [--fps <24|25|30|60>] [--aspect <landscape|portrait>] [--quality-profile <strict|balanced|lenient>] [--shake <reject|stabilize>] [--model <name>] [--guidance <text>] [--duration <seconds>] [--intent <chronological|thematic>] [--theme <text>] [--music <file>] [--encoder <auto|hardware|software>] [--language <auto|code>] [--duck <subtle|balanced|strong>]\n"
 	renderUsage = "usage: ave render <plan.json> [--media-root <dir>] [--force]\n"
 )
 
@@ -83,6 +83,9 @@ func runEdit(ctx context.Context, args []string, mode outputMode, stdin io.Reade
 	options.Interactive = interactive
 	options.Stdin = stdin
 	options.Prompt = stderr
+	options.Progress = stderr
+	options.Verbose = mode == outputVerbose
+	options.Quiet = mode == outputQuiet
 
 	result, err := edit.Run(ctx, options)
 	if err != nil {
@@ -107,6 +110,16 @@ func parseEditOptions(args []string) (edit.Options, error) {
 			options.PlanOnly = true
 		case "--force":
 			options.Force = true
+		case "--jobs":
+			index++
+			if index >= len(args) || strings.HasPrefix(args[index], "-") {
+				return edit.Options{}, fmt.Errorf("--jobs requires a positive worker count")
+			}
+			jobs, convErr := strconv.Atoi(args[index])
+			if convErr != nil || jobs < 1 {
+				return edit.Options{}, fmt.Errorf("invalid --jobs value %q; use a positive integer", args[index])
+			}
+			options.Jobs = jobs
 		case "--output":
 			index++
 			if index >= len(args) || strings.HasPrefix(args[index], "-") {

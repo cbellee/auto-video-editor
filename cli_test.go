@@ -40,10 +40,26 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 
+	cacheDir, err := os.MkdirTemp("", "ave-shared-cache")
+	if err != nil {
+		panic(err)
+	}
+	// Isolate the cache from the developer's real cache location and disable it
+	// by default so the filename-driven fake tools are not short-circuited by
+	// content-addressed cache hits across the shared-byte fixtures. Cache tests
+	// re-enable it explicitly with distinct-content fixtures.
+	if err := os.Setenv("AVE_CACHE_DIR", cacheDir); err != nil {
+		panic(err)
+	}
+	if err := os.Setenv("AVE_NO_CACHE", "1"); err != nil {
+		panic(err)
+	}
+
 	code := m.Run()
 
 	server.Close()
 	_ = os.RemoveAll(configDir)
+	_ = os.RemoveAll(cacheDir)
 	os.Exit(code)
 }
 
@@ -1873,6 +1889,7 @@ for a in "$@"; do
   prev="$a"
 done
 if [ -n "$metafile" ]; then
+  if [ -n "$AVE_TEST_FFMPEG_ANALYSIS_CALLS" ]; then echo call >> "$AVE_TEST_FFMPEG_ANALYSIS_CALLS"; fi
   case "$*" in
     *scdet*)
       case "$input" in
