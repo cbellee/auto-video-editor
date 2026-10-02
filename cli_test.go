@@ -1890,6 +1890,8 @@ for a in "$@"; do
 done
 if [ -n "$metafile" ]; then
   if [ -n "$AVE_TEST_FFMPEG_ANALYSIS_CALLS" ]; then echo call >> "$AVE_TEST_FFMPEG_ANALYSIS_CALLS"; fi
+  if [ -n "$AVE_TEST_FFMPEG_ANALYSIS_READY" ]; then echo ready >> "$AVE_TEST_FFMPEG_ANALYSIS_READY"; fi
+  if [ -n "$AVE_TEST_FFMPEG_SLEEP" ]; then sleep "$AVE_TEST_FFMPEG_SLEEP"; fi
   case "$*" in
     *scdet*)
       case "$input" in
