@@ -150,7 +150,8 @@ func TestEditCreatesChronologicalPlanAndFinishedVideo(t *testing.T) {
 	}
 	for _, want := range []string{
 		"-filter_complex",
-		"concat=n=2:v=1:a=0[video]",
+		"xfade=transition=fade",
+		"[video]",
 		"loudnorm=I=-16.0:TP=-1.5:LRA=11.0",
 		"acrossfade=d=0.250000",
 		"alimiter=limit=0.95",
@@ -1830,6 +1831,31 @@ case "$*" in
   *"-ar 16000"*)
     for output do :; done
     printf 'WAVDATA' > "$output"
+    exit 0
+    ;;
+esac
+# Stabilization detect pass: write the transforms (.trf) file named by result=.
+case "$*" in
+  *vidstabdetect*)
+    trf=""
+    for a in "$@"; do
+      case "$a" in
+        *result=*) trf="${a##*result=}" ;;
+      esac
+    done
+    if [ -n "$trf" ]; then printf 'TRFDATA' > "$trf"; fi
+    exit 0
+    ;;
+esac
+# Stabilization transform pass: write the stabilized clip to the output sink.
+case "$*" in
+  *vidstabtransform*)
+    for output do :; done
+    if [ -n "$AVE_TEST_VIDSTAB_FAIL" ]; then
+      echo "ffmpeg: induced stabilization failure" >&2
+      exit 1
+    fi
+    printf 'stabilized' > "$output"
     exit 0
     ;;
 esac

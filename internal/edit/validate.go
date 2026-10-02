@@ -14,9 +14,25 @@ const (
 	intentThematic      = "thematic"
 )
 
-// approvedTransitions enumerates the transitions the baseline chronological
-// edit may use. Model-selected transitions arrive in a later ticket.
-var approvedTransitions = map[string]bool{transitionCut: true}
+// approvedTransitions enumerates the Transitions the planning stage may choose:
+// a hard cut, opening/closing fades, dips through black or white, directional
+// wipes, and simple slides. Choices outside this set are rejected before a plan
+// is written or rendered. Speed changes are intentionally excluded.
+var approvedTransitions = map[string]bool{
+	transitionCut:        true,
+	transitionFade:       true,
+	transitionDissolve:   true,
+	transitionDipBlack:   true,
+	transitionDipWhite:   true,
+	transitionWipeLeft:   true,
+	transitionWipeRight:  true,
+	transitionWipeUp:     true,
+	transitionWipeDown:   true,
+	transitionSlideLeft:  true,
+	transitionSlideRight: true,
+	transitionSlideUp:    true,
+	transitionSlideDown:  true,
+}
 
 // knownEditIntents enumerates the Edit Intents ave can produce today.
 var knownEditIntents = map[string]bool{intentChronological: true, intentThematic: true}
@@ -74,6 +90,9 @@ func validatePlan(plan Plan) error {
 		}
 		if !approvedTransitions[segment.Transition] {
 			return fmt.Errorf("segment %d has unsupported transition %q", index, segment.Transition)
+		}
+		if err := validateTransitionTiming(index, plan.SelectedSegments); err != nil {
+			return err
 		}
 		if segment.Score == nil {
 			return fmt.Errorf("segment %d is missing its AI score", index)
@@ -133,6 +152,74 @@ func validateDialogue(audio AudioSettings) error {
 		if cut.ToSegment != cut.FromSegment+1 {
 			return fmt.Errorf("dialogue continuity %d must bridge adjacent segments, got %d to %d",
 				index, cut.FromSegment, cut.ToSegment)
+		}
+	}
+	return nil
+}
+
+// validateTransitionTiming enforces the Transition placement and duration
+// rules: a hard cut carries no duration, a fade is reserved for the edit's
+// opening, every other Transition needs a justification, and a Transition's
+// duration stays within the 0.15-0.8s band and twenty percent of each adjoining
+// segment so an effect never overwhelms the footage it joins.
+func validateTransitionTiming(index int, segments []SelectedSegment) error {
+	segment := segments[index]
+	if segment.Transition == transitionCut {
+		if segment.TransitionSeconds != 0 {
+			return fmt.Errorf("segment %d hard cut must not carry a duration", index)
+		}
+		return nil
+	}
+	if segment.Transition == transitionFade && index != 0 {
+		return fmt.Errorf("segment %d fade is only allowed as the opening Transition", index)
+	}
+	if index == 0 && segment.Transition != transitionFade {
+		return fmt.Errorf("segment 0 opening Transition must be a fade or a cut, got %q", segment.Transition)
+	}
+	if strings.TrimSpace(segment.TransitionReason) == "" {
+		return fmt.Errorf("segment %d Transition %q is missing its justification", index, segment.Transition)
+	}
+
+	const epsilon = 1e-6
+	if segment.TransitionSeconds < transitionMinSeconds-epsilon ||
+		segment.TransitionSeconds > transitionMaxSeconds+epsilon {
+		return fmt.Errorf("segment %d Transition %.3fs is outside the %.2f-%.2fs band",
+			index, segment.TransitionSeconds, transitionMinSeconds, transitionMaxSeconds)
+	}
+	this := segment.EndSecond - segment.StartSecond
+	if segment.TransitionSeconds > transitionMaxSegmentFraction*this+epsilon {
+		return fmt.Errorf("segment %d Transition %.3fs exceeds twenty percent of its %.2fs segment",
+			index, segment.TransitionSeconds, this)
+	}
+	if index > 0 {
+		prev := segments[index-1].EndSecond - segments[index-1].StartSecond
+		if segment.TransitionSeconds > transitionMaxSegmentFraction*prev+epsilon {
+			return fmt.Errorf("segment %d Transition %.3fs exceeds twenty percent of the preceding %.2fs segment",
+				index, segment.TransitionSeconds, prev)
+		}
+	}
+	return nil
+}
+
+// validatePlanTransitions re-checks the Transition vocabulary and timing of an
+// externally supplied Edit Plan so a hand-written or tampered plan cannot smuggle
+// an unapproved or out-of-bounds Transition into the render stage.
+func validatePlanTransitions(segments []SelectedSegment) error {
+	for index, segment := range segments {
+		// A plan that predates the Transition vocabulary (or a minimal
+		// hand-written plan) omits the field; an empty Transition is an
+		// implicit hard cut and needs no further checking.
+		if segment.Transition == "" {
+			if segment.TransitionSeconds != 0 {
+				return fmt.Errorf("segment %d implicit cut must not carry a duration", index)
+			}
+			continue
+		}
+		if !approvedTransitions[segment.Transition] {
+			return fmt.Errorf("segment %d has unsupported transition %q", index, segment.Transition)
+		}
+		if err := validateTransitionTiming(index, segments); err != nil {
+			return err
 		}
 	}
 	return nil

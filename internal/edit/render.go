@@ -132,6 +132,9 @@ func loadPlan(path string) (Plan, error) {
 	if err := plan.Render.validate(); err != nil {
 		return Plan{}, err
 	}
+	if err := validatePlanTransitions(plan.SelectedSegments); err != nil {
+		return Plan{}, err
+	}
 	return plan, nil
 }
 
@@ -167,7 +170,16 @@ func verifyPlanSources(plan Plan, baseDir string) ([]renderInput, error) {
 			problems = append(problems, fmt.Sprintf("%s: Source Clip changed since the Edit Plan was created", segment.SourcePath))
 			continue
 		}
-		inputs = append(inputs, renderInput{path: resolved, start: segment.StartSecond, end: segment.EndSecond, isHDR: segment.SourceIsHDR, audioUsable: segment.Metrics.AudioUsable})
+		inputs = append(inputs, renderInput{
+			path:               resolved,
+			start:              segment.StartSecond,
+			end:                segment.EndSecond,
+			isHDR:              segment.SourceIsHDR,
+			audioUsable:        segment.Metrics.AudioUsable,
+			needsStabilization: segment.NeedsStabilization,
+			transition:         segment.Transition,
+			transitionSeconds:  segment.TransitionSeconds,
+		})
 	}
 	if len(problems) > 0 {
 		return nil, fmt.Errorf(
@@ -210,6 +222,12 @@ func renderPlanToFile(
 			resultErr = fmt.Errorf("remove incomplete Finished Video: %w", err)
 		}
 	}()
+
+	inputs, cleanup, err := stabilizeInputs(ctx, inputs)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 
 	args := encodeArgs(inputs, music, duckProfile, settings)
 	args = append(args, "-y", "-f", settings.Container, tempPath)

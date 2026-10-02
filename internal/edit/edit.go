@@ -222,6 +222,11 @@ type SelectedSegment struct {
 	NeedsStabilization bool           `json:"needs_stabilization,omitempty"`
 	// Transition into this segment; the baseline chronological edit hard-cuts.
 	Transition string `json:"transition"`
+	// TransitionSeconds is the Transition's duration; zero for a hard cut.
+	TransitionSeconds float64 `json:"transition_seconds,omitempty"`
+	// TransitionReason records the visual or musical justification for a
+	// non-cut Transition, retained as plan provenance.
+	TransitionReason string `json:"transition_reason,omitempty"`
 	// SampleTimes are the source timestamps of the contact-sheet frames the
 	// model scored, retained for traceability.
 	SampleTimes []float64 `json:"sample_times,omitempty"`
@@ -483,6 +488,20 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		return Result{}, err
 	}
 
+	// In stabilize mode the technical gate keeps shaky candidates; retain only
+	// the high-interest ones so stabilization is spent on footage worth saving
+	// and low-value shake is dropped rather than smoothed.
+	ranked, lowInterestShaky := retainHighInterestShaky(ranked)
+	for _, candidate := range lowInterestShaky {
+		rejected = append(rejected, RejectedSegment{
+			SourcePath:  candidate.relPath,
+			StartSecond: candidate.rng.start,
+			EndSecond:   candidate.rng.end,
+			Metrics:     candidate.metrics,
+			Reasons:     []string{"shaky footage retained only when high-interest"},
+		})
+	}
+
 	durationSource := "automatic"
 	if options.Duration > 0 {
 		durationSource = "override"
@@ -559,11 +578,12 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			MusicCue:           musicCue,
 		})
 		renderInputs = append(renderInputs, renderInput{
-			path:        candidate.clipPath,
-			start:       candidate.rng.start,
-			end:         segmentEnd,
-			isHDR:       candidate.isHDR,
-			audioUsable: candidate.metrics.AudioUsable,
+			path:               candidate.clipPath,
+			start:              candidate.rng.start,
+			end:                segmentEnd,
+			isHDR:              candidate.isHDR,
+			audioUsable:        candidate.metrics.AudioUsable,
+			needsStabilization: candidate.needsStabilization,
 		})
 		dialogueClips = append(dialogueClips, dialogueClip{
 			path:  candidate.clipPath,
@@ -571,6 +591,15 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			end:   segmentEnd,
 		})
 		selectedDuration += segmentEnd - candidate.rng.start
+	}
+
+	// Choose bounded, justified Transitions from the approved vocabulary, then
+	// mirror the choices onto the render inputs so the filtergraph realizes
+	// each fade, dip, or dissolve.
+	planTransitions(segments)
+	for index := range renderInputs {
+		renderInputs[index].transition = segments[index].Transition
+		renderInputs[index].transitionSeconds = segments[index].TransitionSeconds
 	}
 
 	rankedOut := make([]RankedOutSegment, 0, len(droppedOut))
@@ -1113,6 +1142,12 @@ func render(
 	settings RenderSettings,
 	force bool,
 ) error {
+	inputs, cleanup, err := stabilizeInputs(ctx, inputs)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
 	args := encodeArgs(inputs, music, duckProfile, settings)
 	if force {
 		args = append(args, "-y")
@@ -1130,11 +1165,14 @@ func render(
 
 // renderInput is a resolved Source Clip range to include in a Finished Video.
 type renderInput struct {
-	path        string
-	start       float64
-	end         float64
-	isHDR       bool
-	audioUsable bool
+	path               string
+	start              float64
+	end                float64
+	isHDR              bool
+	audioUsable        bool
+	needsStabilization bool
+	transition         string
+	transitionSeconds  float64
 }
 
 // encodeArgs builds the FFmpeg arguments common to every render, excluding the
@@ -1259,18 +1297,53 @@ func encodeArgs(inputs []renderInput, music *musicRender, duckProfile string, se
 		)
 		fmt.Fprintf(
 			&filter,
-			"[bgb%d][fgs%d]overlay=(W-w)/2:(H-h)/2,fps=%d,format=%s[v%d];",
+			"[bgb%d][fgs%d]overlay=(W-w)/2:(H-h)/2,fps=%d,format=%s%s[v%d];",
 			index,
 			index,
 			settings.VideoFrameRate,
 			settings.PixelFormat,
+			segmentFadeChain(inputs, index),
 			index,
 		)
 	}
-	for index := range inputs {
-		fmt.Fprintf(&filter, "[v%d]", index)
+
+	// Join the segments into one timeline. Overlap Transitions (dissolve, wipe,
+	// slide) xfade into the accumulator and shorten it by their duration; hard
+	// cuts and dips concatenate at full length. The effective length is tracked
+	// so the audio bed and output duration match the joined video exactly.
+	videoLabel := "v0"
+	effectiveTotal := inputs[0].end - inputs[0].start
+	for index := 1; index < len(inputs); index++ {
+		segmentDuration := inputs[index].end - inputs[index].start
+		joined := fmt.Sprintf("vjoin%d", index)
+		if isOverlapTransition(inputs[index].transition) {
+			duration := inputs[index].transitionSeconds
+			offset := effectiveTotal - duration
+			if offset < 0 {
+				offset = 0
+			}
+			fmt.Fprintf(&filter,
+				"[%s][v%d]xfade=transition=%s:duration=%s:offset=%s[%s];",
+				videoLabel,
+				index,
+				xfadeStyle(inputs[index].transition),
+				strconv.FormatFloat(duration, 'f', 6, 64),
+				strconv.FormatFloat(offset, 'f', 6, 64),
+				joined,
+			)
+			effectiveTotal += segmentDuration - duration
+		} else {
+			fmt.Fprintf(&filter,
+				"[%s][v%d]concat=n=2:v=1:a=0[%s];",
+				videoLabel,
+				index,
+				joined,
+			)
+			effectiveTotal += segmentDuration
+		}
+		videoLabel = joined
 	}
-	fmt.Fprintf(&filter, "concat=n=%d:v=1:a=0[video];", len(inputs))
+	fmt.Fprintf(&filter, "[%s]null[video];", videoLabel)
 
 	// Build the source-audio bed: split each input's audio and the silent
 	// source into one branch per consuming segment, then hand the ordered
@@ -1324,13 +1397,13 @@ func encodeArgs(inputs []renderInput, music *musicRender, duckProfile string, se
 		}
 		nextSilent++
 	}
-	audioMap := buildAudioFilter(&filter, plans, music, musicInputIndex, duckProfile, totalDuration, settings)
+	audioMap := buildAudioFilter(&filter, plans, music, musicInputIndex, duckProfile, effectiveTotal, settings)
 
 	args = append(args,
 		"-filter_complex", filter.String(),
 		"-map", "[video]",
 		"-map", audioMap,
-		"-t", strconv.FormatFloat(totalDuration, 'f', 6, 64),
+		"-t", strconv.FormatFloat(effectiveTotal, 'f', 6, 64),
 		"-map_metadata", "-1",
 		"-c:v", settings.VideoCodec,
 	)

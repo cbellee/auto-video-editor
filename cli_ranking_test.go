@@ -110,9 +110,18 @@ func TestEditRecordsRankingProvenance(t *testing.T) {
 	if len(plan.Segments) == 0 {
 		t.Fatal("expected selected segments")
 	}
+	approvedTransitions := map[string]bool{
+		"cut": true, "fade": true, "dissolve": true,
+		"dip-black": true, "dip-white": true,
+		"wipeleft": true, "wiperight": true, "wipeup": true, "wipedown": true,
+		"slideleft": true, "slideright": true, "slideup": true, "slidedown": true,
+	}
 	for index, segment := range plan.Segments {
-		if segment.Transition != "cut" {
-			t.Errorf("segment %d transition = %q, want cut", index, segment.Transition)
+		if index == 0 && segment.Transition != "fade" {
+			t.Errorf("segment 0 transition = %q, want the opening fade", segment.Transition)
+		}
+		if !approvedTransitions[segment.Transition] {
+			t.Errorf("segment %d transition = %q, not in the approved vocabulary", index, segment.Transition)
 		}
 		if segment.Score == nil {
 			t.Errorf("segment %d is missing its AI score", index)
