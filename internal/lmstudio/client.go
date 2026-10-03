@@ -367,7 +367,8 @@ func (c *Client) chat(ctx context.Context, model string, messages []chatMessage,
 	var payload struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
@@ -377,7 +378,14 @@ func (c *Client) chat(ctx context.Context, model string, messages []chatMessage,
 	if len(payload.Choices) == 0 {
 		return "", fmt.Errorf("LM Studio chat API returned no choices")
 	}
-	return payload.Choices[0].Message.Content, nil
+	// Reasoning models (e.g. Qwen3 via LM Studio) sometimes leave content empty
+	// and place the answer in reasoning_content; fall back to it so structured
+	// output is still recovered.
+	message := payload.Choices[0].Message
+	if strings.TrimSpace(message.Content) == "" {
+		return message.ReasoningContent, nil
+	}
+	return message.Content, nil
 }
 
 // parseScore extracts a Score from a possibly fenced JSON string and validates

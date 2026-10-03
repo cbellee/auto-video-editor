@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -210,6 +211,30 @@ func TestScoreSendsImageAsDataURL(t *testing.T) {
 	}
 	if !sawImage {
 		t.Error("expected the contact sheet to be sent as a base64 data URL")
+	}
+}
+
+func TestScoreFallsBackToReasoningContentWhenContentEmpty(t *testing.T) {
+	// Some reasoning models (e.g. Qwen3 via LM Studio) return an empty content
+	// field and place the answer in reasoning_content instead.
+	body := `{"choices":[{"message":{"content":"","reasoning_content":` +
+		strconv.Quote(`{"visual_interest":0.8,"subjects":["dog"],"actions":["running"],"energy":0.7,"usefulness":0.9,"redundancy":0.1}`) +
+		`}}]}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	defer server.Close()
+
+	client, _ := New(server.URL)
+	result, err := client.Score(context.Background(), ScoreRequest{Model: "m"})
+	if err != nil {
+		t.Fatalf("Score with answer in reasoning_content: %v", err)
+	}
+	if result.Repaired {
+		t.Error("answer in reasoning_content should parse on the first attempt")
+	}
+	if result.Score.VisualInterest != 0.8 || result.Score.Subjects[0] != "dog" {
+		t.Fatalf("unexpected score %+v", result.Score)
 	}
 }
 
