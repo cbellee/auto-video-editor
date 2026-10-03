@@ -339,6 +339,44 @@ func (c sourceClip) orientation() orientation {
 	return orientationLandscape
 }
 
+// lookPath resolves an executable on PATH. It is a package var so preflight can
+// be unit-tested without the real binaries installed.
+var lookPath = exec.LookPath
+
+// preflight validates every external dependency a run will actually use before
+// the expensive analysis stage begins, so a missing tool, model, or offline LM
+// Studio fails in seconds instead of after minutes of analysis. Only the
+// dependencies this run needs are required: aubio is checked solely when a Music
+// Track is supplied. Error messages mirror the lazy checks they front-run so the
+// remediation guidance is unchanged.
+func preflight(ctx context.Context, lister modelLister, options Options) error {
+	if _, err := lookPath("ffmpeg"); err != nil {
+		return fmt.Errorf("ffmpeg not found on PATH; run `ave doctor` and install ffmpeg")
+	}
+	if _, err := lookPath("ffprobe"); err != nil {
+		return fmt.Errorf("ffprobe not found on PATH; run `ave doctor` and install ffmpeg")
+	}
+	if _, err := resolveWhisper(); err != nil {
+		return err
+	}
+	if _, err := resolveWhisperModel(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(options.Music) != "" {
+		if _, err := lookPath("aubio"); err != nil {
+			return fmt.Errorf("aubio not found on PATH but a Music Track was supplied; run `ave doctor` and install aubio")
+		}
+	}
+	models, err := lister.ListVisionModels(ctx)
+	if err != nil {
+		return fmt.Errorf("LM Studio unavailable for ranking; run `ave doctor` and start its local server: %w", err)
+	}
+	if len(models) == 0 {
+		return fmt.Errorf("no compatible vision model is loaded in LM Studio; load a vision-capable model and retry")
+	}
+	return nil
+}
+
 // Run creates a baseline Chronological Edit Plan and optionally renders it.
 func Run(ctx context.Context, options Options) (Result, error) {
 	report := newProgressReporter(options.Progress, options.Verbose, options.Quiet)
@@ -431,6 +469,31 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		requestedJobs = rememberedJobs()
 	}
 	jobs := resolveJobs(requestedJobs)
+
+	client, err := lmstudio.FromEnv()
+	if err != nil {
+		return Result{}, err
+	}
+	// Validate every dependency this run needs before the expensive analysis
+	// stage, so a missing tool, model, or offline LM Studio fails in seconds
+	// rather than after minutes of per-clip analysis.
+	if err := preflight(ctx, client, options); err != nil {
+		return Result{}, err
+	}
+	// Resolve the ranking model (which may prompt the operator) and edit intent
+	// up front too, so an interactive choice is made before the long analysis
+	// and a non-interactive misconfiguration fails fast rather than after it.
+	model, err := resolveModel(ctx, client, options)
+	if err != nil {
+		return Result{}, err
+	}
+	intent, err := resolveIntent(options)
+	if err != nil {
+		return Result{}, err
+	}
+	theme := strings.TrimSpace(options.Theme)
+	rankingTheme := theme
+
 	report.Stage("Analyzing %d Source Clip(s) with up to %d parallel job(s)", len(clips), jobs)
 	analyses, err := analyzeClipsParallel(ctx, clips, analysis, jobs, report)
 	if err != nil {
@@ -479,21 +542,6 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			len(rejected),
 		)
 	}
-
-	client, err := lmstudio.FromEnv()
-	if err != nil {
-		return Result{}, err
-	}
-	model, err := resolveModel(ctx, client, options)
-	if err != nil {
-		return Result{}, err
-	}
-	intent, err := resolveIntent(options)
-	if err != nil {
-		return Result{}, err
-	}
-	theme := strings.TrimSpace(options.Theme)
-	rankingTheme := theme
 
 	music, err := resolveMusic(ctx, options)
 	if err != nil {

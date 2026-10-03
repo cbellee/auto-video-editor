@@ -489,6 +489,11 @@ func TestEditFailsWithActionableErrorWhenWhisperModelMissing(t *testing.T) {
 	if !strings.Contains(output, "AVE_WHISPER_MODEL") {
 		t.Errorf("error should name AVE_WHISPER_MODEL so the user can fix it:\n%s", output)
 	}
+	// Preflight must reject the run before any clip analysis begins so a missing
+	// dependency never wastes a long analysis pass.
+	if strings.Contains(output, "Analyzing") {
+		t.Errorf("preflight should fail before the analysis stage, but output reached it:\n%s", output)
+	}
 }
 
 func TestEditPlanOnlyAndOutputSafety(t *testing.T) {

@@ -61,7 +61,7 @@ type whisperTranscript struct {
 // that points the operator at ave doctor rather than silently skipping speech.
 func resolveWhisper() (string, error) {
 	for _, name := range whisperBinaries {
-		if path, err := exec.LookPath(name); err == nil {
+		if path, err := lookPath(name); err == nil {
 			return path, nil
 		}
 	}
