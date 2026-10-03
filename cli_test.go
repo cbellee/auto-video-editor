@@ -385,6 +385,47 @@ func TestEditFailsWhenEveryClipIsUnscorable(t *testing.T) {
 	}
 }
 
+// TestEditParsesScoresFromReasoningContent proves the full pipeline completes
+// when the vision model leaves content empty and returns its JSON answer in
+// reasoning_content, as reasoning models (e.g. Qwen3 via LM Studio) do.
+func TestEditParsesScoresFromReasoningContent(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir := t.TempDir()
+	sourceDir := filepath.Join(workingDir, "footage")
+	if err := os.Mkdir(sourceDir, 0o755); err != nil {
+		t.Fatalf("create source directory: %v", err)
+	}
+	for _, name := range []string{"reasoningonly-a.mp4", "reasoningonly-b.mp4"} {
+		if err := os.WriteFile(filepath.Join(sourceDir, name), []byte("fixture"), 0o644); err != nil {
+			t.Fatalf("write source fixture: %v", err)
+		}
+	}
+
+	toolDir := createEditTools(t)
+	env := append(os.Environ(), "PATH="+toolDir)
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status != 0 {
+		t.Fatalf("status = %d, want 0 (scores in reasoning_content must be parsed)\noutput:\n%s", status, output)
+	}
+
+	planData, err := os.ReadFile(filepath.Join(workingDir, "footage-edit.plan.json"))
+	if err != nil {
+		t.Fatalf("read Edit Plan: %v", err)
+	}
+	var plan struct {
+		Selected []struct {
+			SourcePath string `json:"source_path"`
+		} `json:"selected_segments"`
+	}
+	if err := json.Unmarshal(planData, &plan); err != nil {
+		t.Fatalf("decode Edit Plan: %v\n%s", err, planData)
+	}
+	if len(plan.Selected) == 0 {
+		t.Fatalf("expected segments selected from reasoning_content scores; plan:\n%s", planData)
+	}
+}
+
 func TestEditPlanOnlyAndOutputSafety(t *testing.T) {
 	binary := buildCLI(t)
 	workingDir := t.TempDir()
@@ -2310,6 +2351,13 @@ func handleFakeChat(writer http.ResponseWriter, request *http.Request) {
 		content = fakeThemeContent(userText, repair)
 	}
 	writer.Header().Set("Content-Type", "application/json")
+	// "reasoningonly" clips mimic reasoning models (e.g. Qwen3 via LM Studio)
+	// that leave content empty and place the answer in reasoning_content.
+	if strings.Contains(userText, "reasoningonly") {
+		_, _ = fmt.Fprintf(writer,
+			`{"choices":[{"message":{"content":"","reasoning_content":%s}}]}`, strconv.Quote(content))
+		return
+	}
 	_, _ = fmt.Fprintf(writer, `{"choices":[{"message":{"content":%s}}]}`, strconv.Quote(content))
 }
 
