@@ -36,6 +36,19 @@ func TestMain(m *testing.M) {
 	); writeErr != nil {
 		panic(writeErr)
 	}
+	// Seed a discoverable Whisper model so dialogue transcription resolves a
+	// model path; the fake whisper-cli ignores -m but ave now requires one.
+	modelsDir := filepath.Join(configDir, "models")
+	if err := os.MkdirAll(modelsDir, 0o755); err != nil {
+		panic(err)
+	}
+	if writeErr := os.WriteFile(
+		filepath.Join(modelsDir, "ggml-base.en.bin"),
+		[]byte("fake-model"),
+		0o644,
+	); writeErr != nil {
+		panic(writeErr)
+	}
 	if err := os.Setenv("AVE_CONFIG_DIR", configDir); err != nil {
 		panic(err)
 	}
@@ -423,6 +436,58 @@ func TestEditParsesScoresFromReasoningContent(t *testing.T) {
 	}
 	if len(plan.Selected) == 0 {
 		t.Fatalf("expected segments selected from reasoning_content scores; plan:\n%s", planData)
+	}
+}
+
+// TestEditPassesWhisperModelPath proves ave invokes whisper.cpp with an
+// explicit -m model path (resolved from AVE_WHISPER_MODEL) instead of relying on
+// whisper.cpp's built-in default, which caused dialogue transcription to fail.
+func TestEditPassesWhisperModelPath(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "clip.mp4")
+	modelPath := filepath.Join(workingDir, "custom-model.bin")
+	if err := os.WriteFile(modelPath, []byte("fake-model"), 0o644); err != nil {
+		t.Fatalf("write model fixture: %v", err)
+	}
+	whisperLog := filepath.Join(workingDir, "whisper.args")
+	env := append(os.Environ(),
+		"PATH="+createEditTools(t),
+		"AVE_WHISPER_MODEL="+modelPath,
+		"AVE_TEST_WHISPER_LOG="+whisperLog,
+	)
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+
+	logged, err := os.ReadFile(whisperLog)
+	if err != nil {
+		t.Fatalf("read whisper arg log: %v", err)
+	}
+	if !strings.Contains(string(logged), "-m "+modelPath) {
+		t.Errorf("whisper was not invoked with -m %q; args:\n%s", modelPath, logged)
+	}
+}
+
+// TestEditFailsWithActionableErrorWhenWhisperModelMissing proves a missing model
+// fails fast with guidance rather than whisper.cpp's cryptic context error.
+func TestEditFailsWithActionableErrorWhenWhisperModelMissing(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "clip.mp4")
+	// AVE_WHISPER_MODEL set to a non-existent path errors before discovery, so
+	// the shared config (which provides last_model for ranking) is retained.
+	env := append(os.Environ(),
+		"PATH="+createEditTools(t),
+		"AVE_WHISPER_MODEL="+filepath.Join(workingDir, "absent.bin"),
+	)
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status == 0 {
+		t.Fatalf("status = 0, want non-zero when the whisper model is missing\noutput:\n%s", output)
+	}
+	if !strings.Contains(output, "AVE_WHISPER_MODEL") {
+		t.Errorf("error should name AVE_WHISPER_MODEL so the user can fix it:\n%s", output)
 	}
 }
 
@@ -2194,6 +2259,9 @@ done
 # to end (letting adjacent segments form dialogue continuity). Honors an
 # explicit -l override and an AVE_TEST_WHISPER_LANG detection override. Uses
 # only shell builtins because PATH is restricted to the fake tool directory.
+if [ -n "$AVE_TEST_WHISPER_LOG" ]; then
+  echo "$@" >> "$AVE_TEST_WHISPER_LOG"
+fi
 of=""
 lang="auto"
 prev=""

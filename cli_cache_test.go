@@ -32,8 +32,24 @@ func editEnvWith(t *testing.T, toolDir string, overrides map[string]string) []st
 	for key, value := range overrides {
 		env = append(env, key+"="+value)
 	}
+	if configDir := overrides["AVE_CONFIG_DIR"]; configDir != "" {
+		seedWhisperModel(t, configDir)
+	}
 	env = append(env, "PATH="+toolDir)
 	return env
+}
+
+// seedWhisperModel places a discoverable Whisper model under an isolated test
+// config directory so dialogue transcription can resolve a model path.
+func seedWhisperModel(t *testing.T, configDir string) {
+	t.Helper()
+	modelsDir := filepath.Join(configDir, "models")
+	if err := os.MkdirAll(modelsDir, 0o755); err != nil {
+		t.Fatalf("create models dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(modelsDir, "ggml-base.en.bin"), []byte("fake-model"), 0o644); err != nil {
+		t.Fatalf("write model fixture: %v", err)
+	}
 }
 
 // makeDistinctEditSource writes Source Clips whose bytes differ per name so each

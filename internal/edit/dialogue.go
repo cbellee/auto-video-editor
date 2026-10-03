@@ -6,15 +6,24 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/cbellee/auto-video-editor/internal/cache"
+	"github.com/cbellee/auto-video-editor/internal/config"
 )
 
 // whisperBinaries lists the whisper.cpp CLI names ave will use to transcribe
 // source dialogue, in preference order. Matches the names ave doctor checks.
 var whisperBinaries = []string{"whisper-cli", "whisper-cpp"}
+
+// whisperModelEnv overrides the ggml Whisper model file whisper.cpp loads.
+const whisperModelEnv = "AVE_WHISPER_MODEL"
+
+// preferredWhisperModel is chosen first when several models are discovered: a
+// good speed/accuracy default for English dialogue.
+const preferredWhisperModel = "ggml-base.en.bin"
 
 // continuityWindow is how close to a cut dialogue must fall on both sides for
 // the boundary to count as a dialogue-carrying J/L cut.
@@ -59,12 +68,102 @@ func resolveWhisper() (string, error) {
 	return "", fmt.Errorf("whisper.cpp not found on PATH; run `ave doctor` and install whisper-cpp")
 }
 
+// resolveWhisperModel finds the ggml Whisper model file whisper.cpp should load
+// with -m. AVE_WHISPER_MODEL takes precedence (a set-but-missing path is a clear
+// error); otherwise a ggml-*.bin model is discovered in the ave config models
+// directory, ./models, or common Homebrew share locations, preferring
+// ggml-base.en.bin. A total miss returns an actionable error rather than letting
+// whisper.cpp fail cryptically on its built-in default path.
+func resolveWhisperModel() (string, error) {
+	if configured := strings.TrimSpace(os.Getenv(whisperModelEnv)); configured != "" {
+		if isRegularFile(configured) {
+			return configured, nil
+		}
+		return "", fmt.Errorf("whisper model %q set in %s does not exist", configured, whisperModelEnv)
+	}
+	for _, dir := range whisperModelDirs() {
+		if model, ok := findWhisperModel(dir); ok {
+			return model, nil
+		}
+	}
+	return "", fmt.Errorf(
+		"no Whisper model found: set %s to a ggml model file (for example %s) or place one in %s, then run `ave doctor`",
+		whisperModelEnv, preferredWhisperModel, primaryWhisperModelDir())
+}
+
+// whisperModelDirs lists, in priority order, the directories searched for a
+// Whisper model when AVE_WHISPER_MODEL is not set.
+// systemWhisperModelDirs lists OS-level locations (e.g. Homebrew share dirs)
+// searched for a Whisper model after the config and working directories. It is a
+// package var so tests can neutralize it to keep model-resolution tests
+// hermetic.
+var systemWhisperModelDirs = []string{
+	"/opt/homebrew/share/whisper-cpp/models",
+	"/usr/local/share/whisper-cpp/models",
+}
+
+func whisperModelDirs() []string {
+	dirs := []string{primaryWhisperModelDir(), filepath.Join(".", "models")}
+	dirs = append(dirs, systemWhisperModelDirs...)
+	seen := make(map[string]bool, len(dirs))
+	unique := dirs[:0]
+	for _, dir := range dirs {
+		if dir == "" || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		unique = append(unique, dir)
+	}
+	return unique
+}
+
+// primaryWhisperModelDir is the documented home for user-provided models: the
+// models subdirectory of the ave config directory.
+func primaryWhisperModelDir() string {
+	dir, err := config.Dir()
+	if err != nil || dir == "" {
+		return filepath.Join(".", "models")
+	}
+	return filepath.Join(dir, "models")
+}
+
+// findWhisperModel returns a ggml model file in dir, preferring
+// ggml-base.en.bin and otherwise the first match in lexical order.
+func findWhisperModel(dir string) (string, bool) {
+	matches, err := filepath.Glob(filepath.Join(dir, "ggml-*.bin"))
+	if err != nil || len(matches) == 0 {
+		return "", false
+	}
+	sort.Strings(matches)
+	for _, match := range matches {
+		if filepath.Base(match) == preferredWhisperModel && isRegularFile(match) {
+			return match, true
+		}
+	}
+	for _, match := range matches {
+		if isRegularFile(match) {
+			return match, true
+		}
+	}
+	return "", false
+}
+
+// isRegularFile reports whether path exists and is a regular file.
+func isRegularFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
 // transcribeDialogue runs whisper.cpp over every Selected Segment, returning the
 // resolved language, whether it was detected or overridden, and the detected
 // speech spans per clip in source-clip time. An explicit language override is
 // honored as-is; otherwise the first clip's detected language is reported.
 func transcribeDialogue(ctx context.Context, clips []dialogueClip, language string) (string, string, [][]DialogueSpan, error) {
 	binary, err := resolveWhisper()
+	if err != nil {
+		return "", "", nil, err
+	}
+	model, err := resolveWhisperModel()
 	if err != nil {
 		return "", "", nil, err
 	}
@@ -76,7 +175,7 @@ func transcribeDialogue(ctx context.Context, clips []dialogueClip, language stri
 	spans := make([][]DialogueSpan, len(clips))
 	detectedLanguage := ""
 	for index, clip := range clips {
-		language, clipSpans, err := transcribeClip(ctx, binary, clip, requested)
+		language, clipSpans, err := transcribeClip(ctx, binary, model, clip, requested)
 		if err != nil {
 			return "", "", nil, err
 		}
@@ -101,18 +200,20 @@ func transcribeDialogue(ctx context.Context, clips []dialogueClip, language stri
 // transcribeClip extracts a 16 kHz mono WAV for one clip window and runs
 // whisper.cpp over it, returning the detected language and speech spans shifted
 // into source-clip time so they align with Selected Segment ranges.
-func transcribeClip(ctx context.Context, binary string, clip dialogueClip, language string) (string, []DialogueSpan, error) {
+func transcribeClip(ctx context.Context, binary, model string, clip dialogueClip, language string) (string, []DialogueSpan, error) {
 	duration := clip.end - clip.start
 	if duration <= 0 {
 		return "", nil, fmt.Errorf("dialogue window %.2f-%.2f is empty", clip.start, clip.end)
 	}
 
-	// Reuse a cached transcript when the clip content, window, and language are
-	// unchanged so a resumed run does not re-extract audio and re-run whisper.
+	// Reuse a cached transcript when the clip content, window, language, and
+	// model are unchanged so a resumed run does not re-extract audio and re-run
+	// whisper.
 	var cacheKey string
 	if fingerprint, err := sourceFingerprint(clip.path); err == nil {
 		cacheKey = cache.Key("transcript", fingerprint, map[string]string{
 			"language": language,
+			"model":    model,
 			"start":    formatSeconds(clip.start),
 			"end":      formatSeconds(clip.end),
 		})
@@ -144,7 +245,7 @@ func transcribeClip(ctx context.Context, binary string, clip dialogueClip, langu
 	jsonPath := prefix + ".json"
 	defer func() { _ = os.Remove(jsonPath) }()
 
-	whisperArgs := []string{"-f", wavPath, "-l", language, "-oj", "-of", prefix}
+	whisperArgs := []string{"-m", model, "-f", wavPath, "-l", language, "-oj", "-of", prefix}
 	if output, err := exec.CommandContext(ctx, binary, whisperArgs...).CombinedOutput(); err != nil {
 		return "", nil, fmt.Errorf("transcribe dialogue for %s: %s: %w",
 			clip.path, strings.TrimSpace(string(output)), err)
