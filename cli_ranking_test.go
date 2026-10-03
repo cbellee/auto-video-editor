@@ -74,6 +74,9 @@ func editEnv(t *testing.T, toolDir, lmStudioURL, configDir string) []string {
 	}
 	if configDir != "" {
 		env = append(env, "AVE_CONFIG_DIR="+configDir)
+		// Seed a discoverable Whisper model so dialogue transcription resolves a
+		// model path under this test's isolated config directory.
+		seedWhisperModel(t, configDir)
 	}
 	return env
 }
