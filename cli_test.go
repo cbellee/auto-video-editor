@@ -239,6 +239,55 @@ func TestEditDiscoversAVISourceClips(t *testing.T) {
 	}
 }
 
+func TestEditDiscoversM2TSSourceClips(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir := t.TempDir()
+	sourceDir := filepath.Join(workingDir, "m2ts-footage")
+	if err := os.Mkdir(sourceDir, 0o755); err != nil {
+		t.Fatalf("create source directory: %v", err)
+	}
+	// One lowercase .m2ts and one uppercase .M2TS to prove case-insensitive
+	// discovery of the AVCHD/Blu-ray transport-stream container.
+	for _, name := range []string{"a-clip.m2ts", "b-clip.M2TS"} {
+		if err := os.WriteFile(filepath.Join(sourceDir, name), []byte("fixture"), 0o644); err != nil {
+			t.Fatalf("write source fixture: %v", err)
+		}
+	}
+
+	toolDir := createEditTools(t)
+	logPath := filepath.Join(workingDir, "ffmpeg.log")
+	env := append(os.Environ(), "PATH="+toolDir, "AVE_TEST_FFMPEG_LOG="+logPath)
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status != 0 {
+		t.Fatalf("status = %d, want 0\noutput:\n%s", status, output)
+	}
+
+	planPath := filepath.Join(workingDir, "m2ts-footage-edit.plan.json")
+	planData, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read Edit Plan: %v", err)
+	}
+	var plan struct {
+		Segments []struct {
+			SourcePath string `json:"source_path"`
+		} `json:"selected_segments"`
+	}
+	if err := json.Unmarshal(planData, &plan); err != nil {
+		t.Fatalf("decode Edit Plan: %v\n%s", err, planData)
+	}
+
+	found := make(map[string]bool)
+	for _, segment := range plan.Segments {
+		found[filepath.Base(segment.SourcePath)] = true
+	}
+	for _, want := range []string{"a-clip.m2ts", "b-clip.M2TS"} {
+		if !found[want] {
+			t.Errorf("M2TS Source Clip %q not discovered; plan segments: %v", want, found)
+		}
+	}
+}
+
 func TestEditPlanOnlyAndOutputSafety(t *testing.T) {
 	binary := buildCLI(t)
 	workingDir := t.TempDir()

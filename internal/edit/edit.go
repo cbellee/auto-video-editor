@@ -28,10 +28,11 @@ const planVersion = "1"
 const minUsableSeconds = 5.0
 
 var supportedExtensions = map[string]bool{
-	".avi": true,
-	".mkv": true,
-	".mov": true,
-	".mp4": true,
+	".avi":  true,
+	".m2ts": true,
+	".mkv":  true,
+	".mov":  true,
+	".mp4":  true,
 }
 
 // Options controls a baseline Chronological edit.
