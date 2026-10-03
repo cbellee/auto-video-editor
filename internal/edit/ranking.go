@@ -2,6 +2,7 @@ package edit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -74,25 +75,33 @@ type ranker struct {
 }
 
 // rankAll extracts a contact sheet for each candidate, scores it, and returns
-// the ranked candidates in their original chronological order.
-func (r *ranker) rankAll(ctx context.Context, candidates []eligibleCandidate) ([]rankedCandidate, error) {
-	ranked := make([]rankedCandidate, 0, len(candidates))
+// the ranked candidates in their original chronological order. A candidate
+// whose model output cannot be parsed into a valid score (even after the
+// client's one repair attempt) is dropped and returned in skipped rather than
+// aborting the whole run; genuine infrastructure errors still abort. If every
+// candidate fails to score, an error is returned so a broken model is loud.
+func (r *ranker) rankAll(ctx context.Context, candidates []eligibleCandidate) (ranked []rankedCandidate, skipped []eligibleCandidate, err error) {
+	ranked = make([]rankedCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
 		times := sampleTimestamps(candidate.rng, contactSheetFrames)
-		sheet, err := contactSheet(ctx, candidate.clipPath, candidate.rng)
-		if err != nil {
-			return nil, err
+		sheet, sheetErr := contactSheet(ctx, candidate.clipPath, candidate.rng)
+		if sheetErr != nil {
+			return nil, nil, sheetErr
 		}
 		prompt := candidatePrompt(candidate, times, r.guidance, r.theme)
-		result, err := r.client.Score(ctx, lmstudio.ScoreRequest{
+		result, scoreErr := r.client.Score(ctx, lmstudio.ScoreRequest{
 			Model:        r.model,
 			SystemPrompt: systemPrompt(r.intent, r.guidance, r.theme),
 			UserPrompt:   prompt,
 			ImagePNG:     sheet,
 		})
-		if err != nil {
-			return nil, fmt.Errorf("rank candidate %s %.2f-%.2f: %w",
-				candidate.relPath, candidate.rng.start, candidate.rng.end, err)
+		if scoreErr != nil {
+			if errors.Is(scoreErr, lmstudio.ErrUnparseableScore) {
+				skipped = append(skipped, candidate)
+				continue
+			}
+			return nil, nil, fmt.Errorf("rank candidate %s %.2f-%.2f: %w",
+				candidate.relPath, candidate.rng.start, candidate.rng.end, scoreErr)
 		}
 		ranked = append(ranked, rankedCandidate{
 			eligibleCandidate: candidate,
@@ -104,7 +113,12 @@ func (r *ranker) rankAll(ctx context.Context, candidates []eligibleCandidate) ([
 			sampleTimes:       times,
 		})
 	}
-	return ranked, nil
+	if len(ranked) == 0 && len(candidates) > 0 {
+		return nil, nil, fmt.Errorf(
+			"every candidate segment failed scoring (%d of %d); check the vision model output",
+			len(skipped), len(candidates))
+	}
+	return ranked, skipped, nil
 }
 
 // baseScore blends the model's scores into a single ranking value that favors

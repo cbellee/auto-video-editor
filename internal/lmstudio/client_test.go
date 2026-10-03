@@ -3,6 +3,7 @@ package lmstudio
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -108,6 +109,63 @@ func TestScoreFailsAfterRepairAttempt(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "repair") {
 		t.Errorf("error should mention the repair attempt: %v", err)
+	}
+	if !errors.Is(err, ErrUnparseableScore) {
+		t.Errorf("error should wrap ErrUnparseableScore so callers can skip the candidate: %v", err)
+	}
+}
+
+func TestExtractJSONStripsReasoningBlocks(t *testing.T) {
+	object := `{"visual_interest":0.4}`
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "plain object", raw: object, want: object},
+		{name: "fenced object", raw: "```json\n" + object + "\n```", want: object},
+		{
+			name: "reasoning before object",
+			raw:  "<think>The scene looks calm {maybe 0.3}</think>\n" + object,
+			want: object,
+		},
+		{
+			name: "reasoning with braces does not corrupt object",
+			raw:  "<think>weigh {a} vs {b}</think>" + object,
+			want: object,
+		},
+		{
+			name: "unterminated reasoning yields no object",
+			raw:  "<think>I am still thinking and never produced JSON",
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := extractJSON(tc.raw); got != tc.want {
+				t.Errorf("extractJSON(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestScoreParsesResponseWithReasoningBlock(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, chatEnvelope("<think>subjects are dogs {running}</think>\n"+
+			`{"visual_interest":0.8,"subjects":["dog"],"actions":["running"],"energy":0.7,"usefulness":0.9,"redundancy":0.1}`))
+	}))
+	defer server.Close()
+
+	client, _ := New(server.URL)
+	result, err := client.Score(context.Background(), ScoreRequest{Model: "m"})
+	if err != nil {
+		t.Fatalf("Score with reasoning block: %v", err)
+	}
+	if result.Repaired {
+		t.Error("a response whose JSON follows a reasoning block should parse without repair")
+	}
+	if result.Score.VisualInterest != 0.8 || result.Score.Subjects[0] != "dog" {
+		t.Fatalf("unexpected score %+v", result.Score)
 	}
 }
 

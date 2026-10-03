@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -159,6 +160,12 @@ type ScoreRequest struct {
 	ImagePNG     []byte
 }
 
+// ErrUnparseableScore indicates the model returned output that could not be
+// parsed into a valid Score, even after one schema-guided repair attempt. It is
+// distinct from transport errors so a batch caller can skip the single affected
+// candidate and continue rather than aborting the whole run.
+var ErrUnparseableScore = errors.New("model returned an invalid score after one repair attempt")
+
 // ScoreResult pairs the parsed Score with the raw response retained as
 // provenance.
 type ScoreResult struct {
@@ -212,7 +219,7 @@ func (c *Client) Score(ctx context.Context, req ScoreRequest) (ScoreResult, erro
 	}
 	score, parseErr = parseScore(repaired)
 	if parseErr != nil {
-		return ScoreResult{}, fmt.Errorf("model returned an invalid score after one repair attempt: %w", parseErr)
+		return ScoreResult{}, fmt.Errorf("%w: %v", ErrUnparseableScore, parseErr)
 	}
 	return ScoreResult{Score: score, RawResponse: repaired, Repaired: true}, nil
 }
@@ -391,14 +398,40 @@ func parseScore(raw string) (Score, error) {
 }
 
 // extractJSON returns the substring from the first '{' to the last '}',
-// tolerating code fences or stray prose around the object.
+// tolerating code fences or stray prose around the object. Reasoning spans
+// emitted by reasoning models are stripped first so their trailing JSON parses.
 func extractJSON(raw string) string {
+	raw = stripReasoning(raw)
 	start := strings.IndexByte(raw, '{')
 	end := strings.LastIndexByte(raw, '}')
 	if start < 0 || end < start {
 		return ""
 	}
 	return raw[start : end+1]
+}
+
+// stripReasoning removes <think>...</think> reasoning spans emitted by
+// reasoning models (e.g. Qwen3) so that braces inside the reasoning do not
+// corrupt JSON extraction. An unterminated <think> with no closing tag means
+// the model never reached its answer, so everything from it onward is dropped,
+// which the caller treats as an unparseable (and therefore skippable) response.
+func stripReasoning(raw string) string {
+	const (
+		openTag  = "<think>"
+		closeTag = "</think>"
+	)
+	for {
+		open := strings.Index(raw, openTag)
+		if open < 0 {
+			return raw
+		}
+		rest := raw[open+len(openTag):]
+		closeAt := strings.Index(rest, closeTag)
+		if closeAt < 0 {
+			return raw[:open]
+		}
+		raw = raw[:open] + rest[closeAt+len(closeTag):]
+	}
 }
 
 // scoreResponseFormat asks LM Studio for structured JSON output matching the

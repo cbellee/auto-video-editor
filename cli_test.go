@@ -288,6 +288,103 @@ func TestEditDiscoversM2TSSourceClips(t *testing.T) {
 	}
 }
 
+// TestEditSkipsUnscorableClipAndCompletes proves a single clip the vision model
+// cannot score is dropped (recorded as a rejected segment) while the rest of the
+// run completes, rather than aborting the whole edit.
+func TestEditSkipsUnscorableClipAndCompletes(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir := t.TempDir()
+	sourceDir := filepath.Join(workingDir, "footage")
+	if err := os.Mkdir(sourceDir, 0o755); err != nil {
+		t.Fatalf("create source directory: %v", err)
+	}
+	// Two scorable clips plus one whose filename triggers the fake model to
+	// always return non-JSON (unparseable even after the repair attempt).
+	for _, name := range []string{"hero-a.mp4", "hero-b.mp4", "badscore-clip.mp4"} {
+		if err := os.WriteFile(filepath.Join(sourceDir, name), []byte("fixture"), 0o644); err != nil {
+			t.Fatalf("write source fixture: %v", err)
+		}
+	}
+
+	toolDir := createEditTools(t)
+	env := append(os.Environ(), "PATH="+toolDir)
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status != 0 {
+		t.Fatalf("status = %d, want 0 (run should survive one unscorable clip)\noutput:\n%s", status, output)
+	}
+
+	planData, err := os.ReadFile(filepath.Join(workingDir, "footage-edit.plan.json"))
+	if err != nil {
+		t.Fatalf("read Edit Plan: %v", err)
+	}
+	var plan struct {
+		Selected []struct {
+			SourcePath string `json:"source_path"`
+		} `json:"selected_segments"`
+		Rejected []struct {
+			SourcePath string   `json:"source_path"`
+			Reasons    []string `json:"reasons"`
+		} `json:"rejected_segments"`
+	}
+	if err := json.Unmarshal(planData, &plan); err != nil {
+		t.Fatalf("decode Edit Plan: %v\n%s", err, planData)
+	}
+
+	for _, segment := range plan.Selected {
+		if filepath.Base(segment.SourcePath) == "badscore-clip.mp4" {
+			t.Errorf("unscorable clip was selected; it must be excluded")
+		}
+	}
+	if len(plan.Selected) == 0 {
+		t.Errorf("expected the scorable clips to still be selected; plan selected nothing")
+	}
+
+	var skippedReason string
+	for _, segment := range plan.Rejected {
+		if filepath.Base(segment.SourcePath) == "badscore-clip.mp4" {
+			skippedReason = strings.Join(segment.Reasons, "; ")
+		}
+	}
+	if skippedReason == "" {
+		t.Fatalf("unscorable clip not recorded in rejected_segments:\n%s", planData)
+	}
+	if !strings.Contains(strings.ToLower(skippedReason), "score") {
+		t.Errorf("rejected reason %q should explain the model could not score it", skippedReason)
+	}
+	if !strings.Contains(strings.ToLower(output), "skip") {
+		t.Errorf("run should warn about the skipped segment; output:\n%s", output)
+	}
+}
+
+// TestEditFailsWhenEveryClipIsUnscorable proves a totally broken model is loud:
+// when no candidate can be scored the edit fails with a clear message instead of
+// silently producing an empty plan.
+func TestEditFailsWhenEveryClipIsUnscorable(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir := t.TempDir()
+	sourceDir := filepath.Join(workingDir, "footage")
+	if err := os.Mkdir(sourceDir, 0o755); err != nil {
+		t.Fatalf("create source directory: %v", err)
+	}
+	for _, name := range []string{"badscore-a.mp4", "badscore-b.mp4"} {
+		if err := os.WriteFile(filepath.Join(sourceDir, name), []byte("fixture"), 0o644); err != nil {
+			t.Fatalf("write source fixture: %v", err)
+		}
+	}
+
+	toolDir := createEditTools(t)
+	env := append(os.Environ(), "PATH="+toolDir)
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status == 0 {
+		t.Fatalf("status = 0, want non-zero when every candidate fails scoring\noutput:\n%s", output)
+	}
+	if !strings.Contains(strings.ToLower(output), "fail") {
+		t.Errorf("failure message should explain that scoring failed; output:\n%s", output)
+	}
+}
+
 func TestEditPlanOnlyAndOutputSafety(t *testing.T) {
 	binary := buildCLI(t)
 	workingDir := t.TempDir()

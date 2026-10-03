@@ -263,6 +263,9 @@ func TestEditDurationOverride(t *testing.T) {
 	}
 }
 
+// TestEditFailsAfterOneRepairAttempt proves that when the only clip's score is
+// unparseable even after the client's one repair attempt, the run fails loudly
+// via the all-candidates-failed guard rather than producing an empty plan.
 func TestEditFailsAfterOneRepairAttempt(t *testing.T) {
 	binary := buildCLI(t)
 	workingDir, sourceDir := makeEditSource(t, "badscore.mp4")
@@ -272,8 +275,8 @@ func TestEditFailsAfterOneRepairAttempt(t *testing.T) {
 	if status == 0 {
 		t.Fatalf("expected failure when the model never returns a valid score\noutput:\n%s", output)
 	}
-	if !strings.Contains(output, "repair") {
-		t.Errorf("expected a one-repair-then-fail error, got:\n%s", output)
+	if !strings.Contains(output, "failed scoring") {
+		t.Errorf("expected an all-candidates-failed error, got:\n%s", output)
 	}
 }
 
