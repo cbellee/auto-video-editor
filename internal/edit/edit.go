@@ -505,9 +505,21 @@ func Run(ctx context.Context, options Options) (Result, error) {
 
 	report.Stage("Ranking %d eligible segment(s) with model %s", len(eligible), model)
 	rankingClient := &ranker{client: client, model: model, intent: intent, guidance: options.Guidance, theme: theme}
-	ranked, err := rankingClient.rankAll(ctx, eligible)
+	ranked, scoreSkipped, err := rankingClient.rankAll(ctx, eligible)
 	if err != nil {
 		return Result{}, err
+	}
+	for _, candidate := range scoreSkipped {
+		rejected = append(rejected, RejectedSegment{
+			SourcePath:  candidate.relPath,
+			StartSecond: candidate.rng.start,
+			EndSecond:   candidate.rng.end,
+			Metrics:     candidate.metrics,
+			Reasons:     []string{"vision model returned no usable score after one repair attempt"},
+		})
+	}
+	if len(scoreSkipped) > 0 {
+		report.Stage("Skipped %d segment(s) the vision model could not score", len(scoreSkipped))
 	}
 
 	// In stabilize mode the technical gate keeps shaky candidates; retain only
