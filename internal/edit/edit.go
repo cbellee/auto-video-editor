@@ -1379,9 +1379,14 @@ func encodeArgs(inputs []renderInput, music *musicRender, duckProfile string, se
 			settings.VideoHeight,
 			index,
 		)
+		// settb=AVTB pins every segment to FFmpeg's default timebase (1/1000000).
+		// Without it, fps=<rate> leaves the link at 1/<rate> (e.g. 1/30) while
+		// concat joins emit AVTB, so a concat-joined accumulator feeding a later
+		// xfade would fail with a "timebase do not match" error. Normalizing here
+		// keeps every xfade/concat input on one timebase.
 		fmt.Fprintf(
 			&filter,
-			"[bgb%d][fgs%d]overlay=(W-w)/2:(H-h)/2,fps=%d,format=%s%s[v%d];",
+			"[bgb%d][fgs%d]overlay=(W-w)/2:(H-h)/2,fps=%d,format=%s%s,settb=AVTB[v%d];",
 			index,
 			index,
 			settings.VideoFrameRate,
@@ -1407,7 +1412,7 @@ func encodeArgs(inputs []renderInput, music *musicRender, duckProfile string, se
 				offset = 0
 			}
 			fmt.Fprintf(&filter,
-				"[%s][v%d]xfade=transition=%s:duration=%s:offset=%s[%s];",
+				"[%s][v%d]xfade=transition=%s:duration=%s:offset=%s,settb=AVTB[%s];",
 				videoLabel,
 				index,
 				xfadeStyle(inputs[index].transition),
@@ -1418,7 +1423,7 @@ func encodeArgs(inputs []renderInput, music *musicRender, duckProfile string, se
 			effectiveTotal += segmentDuration - duration
 		} else {
 			fmt.Fprintf(&filter,
-				"[%s][v%d]concat=n=2:v=1:a=0[%s];",
+				"[%s][v%d]concat=n=2:v=1:a=0,settb=AVTB[%s];",
 				videoLabel,
 				index,
 				joined,
