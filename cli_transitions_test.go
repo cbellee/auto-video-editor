@@ -239,6 +239,56 @@ func TestRenderRealizesDipWipeAndSlide(t *testing.T) {
 	}
 }
 
+// TestRenderNormalizesTimebaseForMixedTransitions proves a timeline that mixes a
+// hard cut (concat) and an overlap transition (xfade) renders with a single,
+// consistent timebase. Without settb=AVTB normalization, the fps filter leaves
+// each segment at 1/<rate> while concat emits 1/1000000, so a concat-joined
+// accumulator feeding a later xfade aborts FFmpeg with a "timebase do not match"
+// error (issue #41).
+func TestRenderNormalizesTimebaseForMixedTransitions(t *testing.T) {
+	binary := buildCLI(t)
+	workingDir, sourceDir := makeEditSource(t, "a-hero.mp4", "b-hero.mp4", "c-hero.mp4")
+	planPath := filepath.Join(workingDir, "source-edit.plan.json")
+	ffmpegLog := filepath.Join(workingDir, "ffmpeg.log")
+	env := append(os.Environ(), "PATH="+createEditTools(t), "AVE_TEST_FFMPEG_LOG="+ffmpegLog)
+
+	status, output := runCLIInDir(t, binary, workingDir, env, "edit", sourceDir, "--plan-only")
+	if status != 0 {
+		t.Fatalf("edit status = %d, want 0\n%s", status, output)
+	}
+	// Segment 1 joins with a hard cut (concat); segment 2 overlaps via xfade, so
+	// the accumulator crosses from a concat output into an xfade input.
+	mutatePlanSegment(t, planPath, 1, func(segment map[string]any) {
+		segment["transition"] = "cut"
+		segment["transition_seconds"] = 0.0
+		segment["transition_reason"] = "hand-authored hard cut"
+	})
+	mutatePlanSegment(t, planPath, 2, func(segment map[string]any) {
+		segment["transition"] = "wipeleft"
+		segment["transition_seconds"] = 0.3
+		segment["transition_reason"] = "hand-authored wipeleft"
+	})
+
+	status, output = runCLIInDir(t, binary, workingDir, env, "render", planPath)
+	if status != 0 {
+		t.Fatalf("render status = %d, want 0\n%s", status, output)
+	}
+	log, err := os.ReadFile(ffmpegLog)
+	if err != nil {
+		t.Fatalf("read ffmpeg log: %v", err)
+	}
+	graph := string(log)
+	for _, want := range []string{
+		",settb=AVTB[v",                 // every segment branch normalized
+		"concat=n=2:v=1:a=0,settb=AVTB", // hard-cut join normalized
+		"xfade=transition=wipeleft",     // overlap transition realized
+	} {
+		if !strings.Contains(graph, want) {
+			t.Errorf("filtergraph missing %q (timebase normalization):\n%s", want, graph)
+		}
+	}
+}
+
 // TestStabilizeRendersOnlyFlaggedSegments proves stabilize mode keeps a
 // high-interest shaky clip, drops a low-interest one, and runs the two-pass
 // vidstab transform only over the Selected Segment during render (AC 6).
