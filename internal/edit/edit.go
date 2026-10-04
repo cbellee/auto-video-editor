@@ -35,6 +35,11 @@ var supportedExtensions = map[string]bool{
 	".mp4":  true,
 }
 
+// defaultOutputExtension is appended to a Finished Video path when the user
+// supplies an --output value without an extension. It matches the render
+// muxer's default container ("mp4") so the written file is correctly typed.
+const defaultOutputExtension = ".mp4"
+
 // Options controls a baseline Chronological edit.
 type Options struct {
 	SourceDir string
@@ -920,6 +925,10 @@ func artifactPaths(sourceDir, output string) (Result, error) {
 			return Result{}, fmt.Errorf("resolve output path: %w", err)
 		}
 		extension := filepath.Ext(videoPath)
+		if extension == "" {
+			videoPath += defaultOutputExtension
+			extension = defaultOutputExtension
+		}
 		planPath := strings.TrimSuffix(videoPath, extension) + ".plan.json"
 		return Result{PlanPath: planPath, VideoPath: videoPath}, nil
 	}
@@ -931,7 +940,7 @@ func artifactPaths(sourceDir, output string) (Result, error) {
 	baseName := filepath.Base(filepath.Clean(sourceDir)) + "-edit"
 	return Result{
 		PlanPath:  filepath.Join(workingDir, baseName+".plan.json"),
-		VideoPath: filepath.Join(workingDir, baseName+".mp4"),
+		VideoPath: filepath.Join(workingDir, baseName+defaultOutputExtension),
 	}, nil
 }
 
